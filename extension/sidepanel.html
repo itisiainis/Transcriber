@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transcriber</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <!-- One component, two tabs: the tabs share state, and --accent / --tint
+       on this root are what the 380 ms switch transitions. -->
+  <div class="panel" id="panel" data-tab="transcribe">
+    <nav class="tabs" role="tablist">
+      <button class="tab" role="tab" id="tab-transcribe" data-tab="transcribe" aria-selected="true">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg>
+        Transcribe
+      </button>
+      <button class="tab" role="tab" id="tab-analyse" data-tab="analyse" aria-selected="false">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+        Analyse
+        <span class="badge" id="unread" hidden></span>
+      </button>
+      <button class="gear" id="settings-open" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h7M12.5 4.5h1M2.5 11.5h1M6.5 11.5h7"/><circle cx="11" cy="4.5" r="1.5"/><circle cx="5" cy="11.5" r="1.5"/></svg>
+      </button>
+      <span class="tab-indicator" aria-hidden="true"></span>
+    </nav>
+
+    <!-- Transcribe --------------------------------------------------------->
+    <section class="view" id="view-transcribe" role="tabpanel" aria-labelledby="tab-transcribe">
+      <div class="intake">
+        <button class="primary" id="page-btn" disabled>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>
+          <span id="page-btn-label">Transcribe video on page</span>
+        </button>
+        <p class="page-video" id="page-video">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="3.5" width="13" height="9" rx="2"/><path d="m6.5 6 3 2-3 2z" class="fill"/></svg>
+          <span id="page-video-text">Open a YouTube video to transcribe it from here</span>
+        </p>
+
+        <div class="or"><span>OR</span></div>
+
+        <form class="link-form" id="link-form" autocomplete="off">
+          <input type="text" id="link-input" placeholder="Paste a YouTube link" spellcheck="false" aria-label="YouTube link">
+          <button type="submit" class="square" id="link-btn" aria-label="Transcribe link">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 8h11M9 3.5 13.5 8 9 12.5"/></svg>
+          </button>
+        </form>
+        <p class="form-error" id="link-error" hidden></p>
+      </div>
+
+      <div class="list-area">
+        <div class="status-line">
+          <span class="worker" id="worker"><i class="dot"></i><span id="worker-text">Connecting…</span></span>
+          <span id="count"></span>
+        </div>
+        <p class="host-help" id="host-help" hidden></p>
+        <ol class="rows" id="rows"></ol>
+        <p class="empty" id="empty" hidden>Nothing transcribed yet.</p>
+      </div>
+    </section>
+
+    <!-- Analyse ------------------------------------------------------------>
+    <section class="view" id="view-analyse" role="tabpanel" aria-labelledby="tab-analyse" hidden>
+      <!-- Storage, not a picker: prompts are chosen on a video's row. -->
+      <div class="prompt-bar">
+        <button class="lib-btn" id="lib-open">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.5h5.5L12.5 4.5v10h-8.5z"/><path d="M9.5 1.5v3h3"/></svg>
+          My prompts <span class="muted" id="prompt-count"></span>
+        </button>
+        <button class="add-btn" id="prompt-add">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
+          add
+        </button>
+      </div>
+      <div class="list-area" id="analyse-list"></div>
+    </section>
+
+    <!-- Transcript: slides in over the whole panel --------------------------->
+    <section class="screen" id="transcript" aria-hidden="true">
+      <header class="screen-head">
+        <button class="icon-btn" id="tr-back" aria-label="Back">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+        <div class="screen-title">
+          <h1 id="tr-title"></h1>
+          <p class="meta"><span id="tr-meta"></span><span class="chip" id="tr-source"></span></p>
+        </div>
+        <!-- Actions sit at the top with every other control, under the name. -->
+        <div class="screen-actions">
+          <div class="toolbar">
+            <button class="tool" id="tr-copy">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M3.5 10.5h-1v-8h8v1"/></svg>
+              <span>Copy</span>
+            </button>
+            <button class="tool" id="tr-download">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>
+              <span>Download</span>
+            </button>
+            <button class="tool danger" id="tr-delete">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 9h5.8l.6-9"/></svg>
+              <span>Delete</span>
+            </button>
+          </div>
+          <p class="form-error" id="tr-error" hidden></p>
+          <button class="primary clay" id="tr-analyse">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+            Analyse
+          </button>
+        </div>
+      </header>
+      <div class="screen-body" id="tr-body"></div>
+    </section>
+    <!-- Analysis: clay throughout, follow-ups stacked under the original ---->
+    <section class="screen clay-screen" id="analysis" aria-hidden="true">
+      <header class="screen-head">
+        <button class="icon-btn" id="an-back" aria-label="Back">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+        <div class="screen-title">
+          <h1 id="an-title"></h1>
+          <p class="meta"><span class="chip" id="an-prompt"></span><span id="an-meta"></span></p>
+        </div>
+        <div class="screen-actions ask-bar">
+          <div class="toolbar">
+            <button class="tool" id="an-transcript">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg>
+              <span>Transcript</span>
+            </button>
+            <button class="tool" id="an-copy">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M3.5 10.5h-1v-8h8v1"/></svg>
+              <span>Copy</span>
+            </button>
+            <button class="tool danger" id="an-delete">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 9h5.8l.6-9"/></svg>
+              <span>Delete</span>
+            </button>
+          </div>
+          <form id="an-ask" autocomplete="off">
+            <textarea id="an-question" rows="1" placeholder="Ask about this analysis…"></textarea>
+            <button type="submit" class="send" id="an-send" aria-label="Ask">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 8h11M9 3.5 13.5 8 9 12.5"/></svg>
+            </button>
+          </form>
+          <p class="form-error" id="an-error" hidden></p>
+        </div>
+      </header>
+      <div class="screen-body doc" id="an-body"></div>
+    </section>
+
+    <!-- Prompt library ---------------------------------------------------->
+    <section class="screen clay-screen" id="library" aria-hidden="true">
+      <header class="screen-head simple">
+        <button class="icon-btn" id="lib-back" aria-label="Back">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+        <h1>My prompts</h1>
+        <span class="muted" id="lib-count"></span>
+      </header>
+      <div class="screen-body tinted" id="lib-body"></div>
+      <footer class="screen-foot note">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.5h5.5L12.5 4.5v10h-8.5z"/><path d="M9.5 1.5v3h3"/></svg>
+        Each one is a .md file in prompts/ — editable either way
+      </footer>
+    </section>
+
+    <!-- New / edit prompt: exactly three fields --------------------------->
+    <section class="screen clay-screen" id="prompt-form" aria-hidden="true">
+      <header class="screen-head simple">
+        <button class="icon-btn" id="pf-back" aria-label="Back">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+        <h1 id="pf-heading">New prompt</h1>
+        <div class="screen-actions">
+          <div class="toolbar">
+            <button class="tool primary-tool" id="pf-save">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7"/></svg>
+              <span>Save</span>
+            </button>
+            <button class="tool" id="pf-cancel">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+              <span>Cancel</span>
+            </button>
+            <button class="tool danger" id="pf-delete" hidden>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 9h5.8l.6-9"/></svg>
+              <span>Delete</span>
+            </button>
+          </div>
+        </div>
+      </header>
+      <form class="screen-body tinted form" id="pf" autocomplete="off">
+        <label for="pf-name">Name</label>
+        <input id="pf-name" spellcheck="false" placeholder="who-is-selling" maxlength="40">
+        <p class="hint" id="pf-name-hint">Saved as prompts/&lt;name&gt;.md · this is what you pick from the list</p>
+        <label for="pf-desc">Short description</label>
+        <input id="pf-desc" placeholder="Sponsorships, own products, undeclared interests" maxlength="120">
+        <p class="hint">The line under the name when you are choosing — keep it to one</p>
+        <label for="pf-body">Prompt</label>
+        <textarea id="pf-body" placeholder="What should Claude do with the transcript?"></textarea>
+        <p class="hint">The transcript is appended below this, with its own guard line</p>
+        <p class="form-error" id="pf-error" hidden></p>
+      </form>
+    </section>
+
+    <!-- Settings: one source of truth, the settings table (settings.py) ---->
+    <section class="screen" id="settings" aria-hidden="true">
+      <header class="screen-head simple">
+        <button class="icon-btn" id="set-back" aria-label="Back">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+        <h1>Settings</h1>
+        <span class="muted" id="set-status"></span>
+      </header>
+      <div class="screen-body tinted settings-body" id="set-body"></div>
+    </section>
+  </div>
+
+  <script src="markdown.js"></script>
+  <script src="sidepanel.js"></script>
+  <script src="analyse.js"></script>
+  <script src="settings.js"></script>
+</body>
+</html>

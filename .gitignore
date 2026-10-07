@@ -1,0 +1,22 @@
+# модели и бинарники — качаются отдельно
+models/
+whisper/
+
+# данные и результаты работы
+audio/
+transcripts/
+analyses/
+*.log
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# локальные настройки и ключи
+.env
+*.db
+host/com.transcriber.host.json
+# личные заметки
+CLAUDE/TASK.md

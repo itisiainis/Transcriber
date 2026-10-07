@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Transcriber",
+  "version": "0.1.0",
+  "description": "YouTube-video-to-transcript-to-Claude-analysis, from a side panel.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Q2PlT2Cq4YzyHpkWyxTZmFcNGkMsxfc7WxECZg3zhSokv88WTw9CvYosyTOHJB7et7NKDuYB0aJ4pDzaerjwesgCJfsg9gD1ueLTMv6+SCinYe77HvsTDrlhS+KI23a/cnzPOXRsgKeQ5cJScyF0a7ENGb9rsC7PxWbDuNFeqyaG9xLtBbXxlMVClbrOKUS5oiWDmKp/ps3BH4gp5laTIfYxIW+5InmFKLAeuiE2B+t2gPwld5c3QhFyjCRhrFsGIiZ9QqrvahBLsx7wZhsZMBfXNbZe/8FQmgxrI0JzHc482ixqIyFjqjQ6V71DkmLjJHb1y6/Uup6cnynmbqPVwIDAQAB",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["sidePanel", "nativeMessaging", "tabs", "scripting", "notifications", "storage"],
+  "host_permissions": ["https://www.youtube.com/*", "https://m.youtube.com/*"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": {
+    "default_title": "Transcriber",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  }
+}
