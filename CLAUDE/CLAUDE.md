@@ -1,6 +1,6 @@
 # Transcriber
 
-Personal tool: YouTube video → transcript → Claude analysis, with a SQLite
+Personal tool: YouTube or RuTube video → transcript → Claude analysis, with a SQLite
 log of everything, so the owner can later measure whether it changed his
 watching habits.
 
@@ -24,6 +24,9 @@ settings.py     Tunable settings: `settings` table, module constants as
 analyze.py      Runs a transcript past Claude Code (`claude -p`) with a prompt,
                 and resumes that session for follow-ups.
 run.py          Wires the two together: transcribe, store, optionally analyse.
+channel.py      A channel's video list (yt-dlp flat-playlist), for picking from.
+batch.py        Several transcriptions queued as ordinary jobs, with estimates.
+export.py       Transcripts out as .txt (combined) or a zip (separate).
 jobs.py         Job queue + single-worker lock (own tables: jobs, worker).
 worker.py       Runs queued jobs in two lanes (transcribe / analyse), exits
                 when idle. Started by host.py, never by hand.
@@ -32,6 +35,7 @@ host/           host.bat (Chrome's entry point), install.ps1 (registry key).
 extension/      MV3 side panel. sidepanel.js = shell + Transcribe tab,
                 analyse.js = Analyse tab and its screens, markdown.js =
                 renderer for answers, settings.js = settings screen,
+                channel.js = a channel's videos to pick from,
                 background.js = notifications.
 prompts/*.md    Analysis prompts. Filename stem = the name shown when choosing;
                 optional frontmatter `description:` is the line under it.
@@ -51,6 +55,11 @@ python analyze.py <url|video_id|last> --prompt factcheck
 python analyze.py last --more "why is the hh index a weak measure?"
 python analyze.py last --thread
 python analyze.py --list
+python channel.py <channel url>          # list it; ✓ = already in the panel
+python batch.py add <video or channel url>... [--limit N]
+python batch.py list | run | clear
+python export.py --ids a,b,c [--mode combined|separate] [--out batch.txt]
+python export.py --last 3
 ```
 
 ## Decisions already made — don't relitigate these
@@ -73,6 +82,15 @@ from the actual distribution rather than guesswork:
 entirely — a translation of a machine transcription is two layers of error,
 and whisper on the real audio beats it.
 
+**Caption languages are matched on their base code.** Auto-dubbed videos
+carry one ASR track per dub language (21 on one test video, Arabic first).
+yt-dlp reports the original as `en-US` while the track is `en`, so an exact
+match failed and the fallback took the first track — Arabic captions of an
+AI dub. `pick_track()` now matches `en-US` to `en`. The `caption_language`
+setting ("auto" = the original audio) is tried first; if the video has no
+captions in that language, the original audio's are used. It is separate
+from `language`, which is only what whisper listens for.
+
 **Hardware: AMD GPU, so no CUDA.** whisper.cpp runs on the BLAS CPU build.
 Settings `-t 8 -bo 1 -bs 1` took a test clip from 56s to 26.6s. large-v3-turbo
 is *slower* than medium on CPU (bigger encoder, and encode is ~70% of runtime)
@@ -82,6 +100,63 @@ be compiled by hand — worth doing later, not now.
 **yt-dlp needs `-f "bestaudio[protocol^=http]"`.** The default picks a
 fragmented HLS stream that dies under the owner's connection. YouTube media
 hosts are unreachable without a VPN from his location.
+
+**Platforms: captions are YouTube-only; everything else goes straight to
+whisper.** `transcribe.parse_url(url) -> (platform, video_id)` is the only
+place a URL is read; an unknown site raises with the host named. Sites live in
+`transcribe.PLATFORMS` (id pattern, the URL yt-dlp gets, download format).
+Video ids don't collide across sites (YouTube 11 chars, RuTube 32 hex), so
+`video_id` stays the one join key and a bare id says which site it is. A
+non-YouTube video records the caption_reason `"platform has no captions"`
+with no track and no quality numbers: nothing was tried, so it must never be
+counted as a caption rejection when tuning thresholds. RuTube serves only HLS
+with audio muxed into the video, so it downloads `worst[acodec!=none]` and
+ffmpeg keeps the sound; its HLS is fast without the VPN, slow through it.
+`videos.platform` defaults to 'youtube' (every older row was); `upload_date`
+(YYYY-MM-DD) is stored from now on and not backfilled.
+
+**A batch is ordinary transcribe jobs, not a second queue.** The task that
+asked for batching specced a separate `queue` table; the owner chose instead
+"select several videos in the channel's list and transcribe them one by one",
+and the existing `jobs` table already is a crash-safe, single-worker queue.
+So a batch is jobs with entry_point `channel` (picked in the panel) or
+`batch` (batch.py), run by the same worker in the order queued. One whisper at
+a time is all this CPU takes. A batch job left `running` by a dead worker is
+requeued on the next start, once (`jobs.requeued`); a non-batch one fails as
+before, since someone is watching it.
+
+**Estimates use the median realtime_factor, never a constant**
+(`batch.estimate_seconds()`): whisper runs only for non-YouTube videos, which
+always go through whisper; every run for YouTube, since that is the mix a
+YouTube video gets. 0.25 only while there is no history. It is proportional,
+so it under-estimates very short videos, where loading the model dominates.
+
+**Channel listings don't fetch per-video metadata.** `--flat-playlist` gives
+id, title and duration from the listing pages; a request per video would
+make a 500-video channel crawl. The real `upload_date` arrives when a video
+is transcribed. For sorting, the listing's own date is shown: RuTube's
+timestamp, YouTube's "3 weeks ago" turned into an approximate date (shown
+with ≈). Neither is stored.
+
+**Export header.** Every exported transcript starts with this, identical in
+combined and separate mode, so a file pulled out of the zip still says what it
+is (export.py; the rule is 52 `═`):
+
+```
+════════════════════════════════════════════════════
+<title>
+<channel> · <platform> · <duration mm:ss>
+Опубликовано: <upload_date> · Расшифровано: <submitted_at, local>
+<url>
+════════════════════════════════════════════════════
+```
+
+Duration is total minutes (75:03 for 1h15m). `Расшифровано` is the latest
+done submission, in local time. A missing value is `—`. Combined is the
+default: the usual destination is a claude.ai project, and one file beats
+forty. Separate names each file `<upload_date>-<slug>.txt` (`undated-…`
+when the date is missing; the slug keeps Cyrillic). Transcripts only, never
+analyses.
 
 **Claude Code, not the API.** Runs on the owner's subscription. Web search is
 allowed (fact-checking needs it); file and shell tools are removed via
@@ -119,7 +194,9 @@ Windows can't execute.
 
 ## What's logged and why
 
-`videos` holds what's permanently true (title, channel, duration).
+`videos` holds what's permanently true (platform, title, channel, duration,
+upload_date). `entry_point` on a submission is `page`, `link`, `channel` (a
+pick from a channel's list) or `batch` (batch.py).
 `submissions` holds one row per run: entry point, source, the three caption
 numbers, rejection reasons, per-stage timings. `analyses` holds one row per
 Claude run — original or follow-up — with `seq`, `session_id`, `parent_id`,
@@ -154,6 +231,11 @@ deeper `#A8492A` is for.
 detected title, a link field, worker status, then the list. Rows are named by
 video title with channel underneath. In-progress rows keep their place and show
 time remaining; failed rows offer Retry. Failures are rows in the db too.
+
+**The Analyse tab lists "Transcribed, not analysed" above "Done".** Running
+jobs first, then videos waiting for an analysis, then finished analyses.
+Analysing a new video is the common action and must not sit below a growing
+history (the mockup has Done first; the owner reversed it after use).
 
 **Choosing a prompt happens on the row, when you press Analyse** — never in a
 sheet, a dropdown, or a bar that remembers a selection. Pressing Analyse
@@ -190,6 +272,21 @@ buttons squeezed beside the title were tried and replaced.
 **Destructive buttons take two presses** (`confirmTwice()` in sidepanel.js):
 the first turns the label into the question — "Delete + 2 follow-ups?" — and
 the second acts. No dialogs anywhere in the panel.
+
+**Multi-select on the Transcribe list** is entered from the Select button in
+the list header or a right-click on a row — never a long-press, which is a
+touch idiom and fights text selection. It covers export (one .txt, or a
+separate .zip) and delete alike: being able to select several things and do
+only one thing with them feels broken. Queued and running rows can't be
+ticked. Escape or Done leaves it.
+
+**A channel's videos open as a screen** (channel.js) from the intake button
+on a channel page ("Show this channel's videos") or a pasted channel link.
+Sortable by date, title and length (press again to reverse); each row shows
+its estimate; the batch button carries the count and total ("Transcribe 12
+videos · ~4h 20m") and recalculates per tick. Videos already in the panel show
+as transcribed, queued or running instead of a checkbox. They are queued in
+the order shown.
 
 **Settings** open from the sliders button at the right end of the tab bar.
 The screen edits the `settings` table through the host; each change saves
@@ -232,7 +329,10 @@ job with a notification, never something waited on with the panel open.
    `models/ggml-silero-v6.2.0.bin` from huggingface.co/ggml-org/whisper-vad.
    `bench_vad.py` times it against the baseline and reports words kept —
    turn it on only if a real video shows a saving without losing words.
-6. Feed the low-confidence spans into the analysis prompt, so `factcheck`
+6. Estimates are proportional to length only. A fixed per-video term
+   (model load, ~10 s) would fix short videos; the timings to fit it are in
+   `submissions`.
+7. Feed the low-confidence spans into the analysis prompt, so `factcheck`
    hedges on figures whisper was unsure of. The data is there; nothing
    consumes it yet.
 

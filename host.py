@@ -44,7 +44,13 @@ import subprocess
 import time
 from contextlib import closing
 
+import base64
+import threading
+
 import analyze
+import batch
+import channel
+import export
 import jobs
 import settings
 import store
@@ -183,7 +189,7 @@ def source_label(source: str | None) -> str | None:
 def build_rows(conn) -> list[dict]:
     videos = conn.execute(
         """
-        SELECT v.video_id, v.title, v.channel, v.duration, v.first_seen_at,
+        SELECT v.video_id, v.platform, v.title, v.channel, v.duration, v.first_seen_at,
                s.status, s.error, s.source, s.entry_point,
                (SELECT COUNT(*) FROM analyses a WHERE a.video_id = v.video_id
                                                AND a.deleted_at IS NULL) AS n_analyses,
@@ -199,6 +205,7 @@ def build_rows(conn) -> list[dict]:
     active = {j["video_id"]: j for j in transcribing}
     queue_order = [j["id"] for j in transcribing if j["status"] == "queued"]
     whisper_ratio, download_ratio = ratios(conn)
+    factors = batch.factors(conn)
 
     rows = {}
     for v in videos:
@@ -210,6 +217,7 @@ def build_rows(conn) -> list[dict]:
         last_job = jobs.last_for(conn, vid) if state == "failed" else None
         rows[vid] = {
             "video_id": vid,
+            "platform": v["platform"],
             "title": v["title"] or (last_job and last_job["title"]),
             "channel": v["channel"] or (last_job and last_job["channel"]),
             "duration": v["duration"] or (last_job and last_job["duration"]),
@@ -245,6 +253,8 @@ def build_rows(conn) -> list[dict]:
             base["progress"] = progress(job, duration, whisper_ratio, download_ratio)
         else:
             base["queue_position"] = queue_order.index(job["id"]) + 1
+            platform = tx.parse_url(job["url"])[0]
+            base["estimate"] = batch.estimate_seconds(duration, platform, factors)
         rows[vid] = base
 
     return sorted(rows.values(), key=lambda r: r["order"], reverse=True)
@@ -276,10 +286,10 @@ def cmd_transcribe(conn, msg) -> dict:
     url = (msg.get("url") or "").strip()
     entry = msg.get("entry") if msg.get("entry") in ("page", "link") else "link"
     try:
-        vid = tx.video_id(url)
-    except ValueError:
-        return {"ok": False, "error": "That isn't a YouTube link"}
-    job_id = jobs.enqueue(conn, vid, f"https://www.youtube.com/watch?v={vid}", entry)
+        platform, vid = tx.parse_url(url)
+    except ValueError as e:
+        return {"ok": False, "error": f"Can't transcribe this link: {e.args[0]}"}
+    job_id = jobs.enqueue(conn, vid, tx.video_url(vid, platform), entry)
     ensure_worker(conn)
     return {"video_id": vid, "job_id": job_id}
 
@@ -307,6 +317,90 @@ def cmd_transcript(conn, msg):
     head["source_label"] = source_label(t.get("source"))
     return [{**head, "segments": p, "part": i, "parts": len(parts)}
             for i, p in enumerate(parts)]
+
+
+# --- channels and batches --------------------------------------------------
+#
+# Listing a channel is a few seconds of yt-dlp per few hundred videos — too
+# slow to answer inside one request. So the first `channel` call starts it
+# on a thread and says "loading"; the panel asks again until it is done.
+
+LISTING_TTL = 600       # seconds a finished listing is reused before it is fetched again
+_listings: dict = {}    # listing url -> {"status", "result" | "error", "at"}
+_listings_lock = threading.Lock()
+
+
+def _list_channel(key: str, url: str) -> None:
+    try:
+        entry = {"status": "done", "result": channel.enumerate_channel(url)}
+    except Exception as e:
+        log.exception("listing %s failed", url)
+        entry = {"status": "failed", "error": short_error(f"{type(e).__name__}: {e}")}
+    with _listings_lock:
+        _listings[key] = {**entry, "at": time.time()}
+
+
+def cmd_channel(conn, msg) -> dict:
+    url = (msg.get("url") or "").strip()
+    try:
+        _, key = channel.parse_channel(url)
+    except ValueError as e:
+        return {"ok": False, "error": f"Can't list this link: {e.args[0]}"}
+    with _listings_lock:
+        entry = _listings.get(key)
+        stale = entry and entry["status"] != "loading" and (
+            msg.get("refresh") or time.time() - entry["at"] > LISTING_TTL)
+        if entry is None or stale or entry["status"] == "failed" and msg.get("refresh"):
+            entry = _listings[key] = {"status": "loading", "at": time.time()}
+            threading.Thread(target=_list_channel, args=(key, url), daemon=True).start()
+    if entry["status"] == "loading":
+        return {"status": "loading"}
+    if entry["status"] == "failed":
+        with _listings_lock:
+            _listings.pop(key, None)      # the next ask tries again
+        return {"ok": False, "error": entry["error"]}
+
+    # Present-ness and estimates are re-read on every ask: the list stays open
+    # while its videos get transcribed.
+    result = entry["result"]
+    videos = channel.mark_present(conn, [dict(v) for v in result["videos"]])
+    f = batch.factors(conn)
+    for v in videos:
+        v["estimate"] = batch.estimate_seconds(v["duration"], v["platform"], f)
+    return {"status": "done", **result, "videos": videos}
+
+
+def cmd_transcribe_many(conn, msg) -> dict:
+    """A channel pick: queued in the order sent, run one by one."""
+    picks = msg.get("videos") or []
+    name = msg.get("channel")
+    queued = 0
+    for v in picks:
+        try:
+            platform, vid = tx.parse_url(v.get("video_id") or "")
+        except ValueError:
+            continue
+        jobs.enqueue(conn, vid, tx.video_url(vid, platform), "channel",
+                     {"title": v.get("title"), "channel": name, "duration": v.get("duration")})
+        queued += 1
+    ensure_worker(conn)
+    return {"queued": queued}
+
+
+EXPORT_CHUNK = 600_000      # base64 characters per message, under Chrome's 1 MB cap
+
+
+def cmd_export(conn, msg):
+    """The file comes back as base64 in parts; the panel joins and saves it."""
+    try:
+        name, data = export.export(list(msg.get("video_ids") or []), msg.get("mode") or "combined")
+    except ValueError as e:
+        return {"ok": False, "error": str(e.args[0])}
+    b64 = base64.b64encode(data).decode("ascii")
+    chunks = [b64[i:i + EXPORT_CHUNK] for i in range(0, len(b64), EXPORT_CHUNK)] or [""]
+    mime = "application/zip" if name.endswith(".zip") else "text/plain;charset=utf-8"
+    return [{"filename": name, "mime": mime, "data": c, "part": i, "parts": len(chunks)}
+            for i, c in enumerate(chunks)]
 
 
 # --- the Analyse side ------------------------------------------------------
@@ -471,7 +565,7 @@ def cmd_thread(conn, msg) -> dict:
             )
         ]
     return {
-        "analysis_id": root["id"], "video_id": root["video_id"],
+        "analysis_id": root["id"], "video_id": root["video_id"], "platform": video["platform"],
         "title": video["title"], "channel": video["channel"], "duration": video["duration"],
         "prompt": root["prompt_template"], "verdict": root["verdict"],
         "resumable": bool(root["session_id"]),
@@ -677,6 +771,9 @@ COMMANDS = {
     "transcribe": cmd_transcribe,
     "retry": cmd_retry,
     "transcript": cmd_transcript,
+    "channel": cmd_channel,
+    "transcribe_many": cmd_transcribe_many,
+    "export": cmd_export,
     "thread": cmd_thread,
     "analyse": cmd_analyse,
     "follow_up": cmd_follow_up,

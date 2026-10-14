@@ -79,6 +79,10 @@ def migrate(conn) -> None:
         # row stays for the before/after comparison. See soft_delete_video().
         ("videos", "deleted_at", "TEXT"),
         ("analyses", "deleted_at", "TEXT"),
+        # Every video before this column was YouTube, so the default is
+        # right for them. upload_date is not backfilled: older rows stay NULL.
+        ("videos", "platform", "TEXT NOT NULL DEFAULT 'youtube'"),
+        ("videos", "upload_date", "TEXT"),
     ]
     for table, column, coltype in wanted:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -133,16 +137,19 @@ def upsert_video(conn, result: dict) -> None:
     """
     conn.execute(
         """
-        INSERT INTO videos (video_id, title, channel, duration, first_seen_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO videos (video_id, platform, title, channel, duration,
+                            upload_date, first_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_id) DO UPDATE SET
+            platform = excluded.platform,
             title = excluded.title,
             channel = excluded.channel,
             duration = excluded.duration,
+            upload_date = COALESCE(excluded.upload_date, upload_date),
             deleted_at = NULL
         """,
-        (result["video_id"], result["title"], result["channel"],
-         result["duration"], now()),
+        (result["video_id"], result.get("platform", "youtube"), result["title"],
+         result["channel"], result["duration"], result.get("upload_date"), now()),
     )
 
 
@@ -152,6 +159,8 @@ def save_transcript(result: dict) -> Path:
     path = TRANSCRIPT_DIR / f"{result['video_id']}.json"
     payload = {
         "video_id": result["video_id"],
+        "platform": result.get("platform", "youtube"),
+        "upload_date": result.get("upload_date"),
         "title": result["title"],
         "channel": result["channel"],
         "duration": result["duration"],
@@ -195,11 +204,12 @@ def record_submission(conn, result: dict, entry_point: str = "link",
     return cur.lastrowid
 
 
-def record_failure(conn, video_id: str, error: str, entry_point: str = "link") -> int:
+def record_failure(conn, video_id: str, error: str, entry_point: str = "link",
+                   platform: str = "youtube") -> int:
     """Failures are data too — they tell you how often YouTube blocks you."""
     conn.execute(
-        "INSERT OR IGNORE INTO videos (video_id, first_seen_at) VALUES (?, ?)",
-        (video_id, now()),
+        "INSERT OR IGNORE INTO videos (video_id, platform, first_seen_at) VALUES (?, ?, ?)",
+        (video_id, platform, now()),
     )
     # A retry of a deleted video is a new submission: show it again.
     conn.execute("UPDATE videos SET deleted_at = NULL WHERE video_id = ?", (video_id,))

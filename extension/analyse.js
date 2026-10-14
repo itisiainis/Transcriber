@@ -145,7 +145,7 @@ async function seek(videoId, t) {
       return;
     } catch { /* fall through to a new tab */ }
   }
-  chrome.tabs.create({ url: `https://www.youtube.com/watch?v=${videoId}&t=${t}s` });
+  chrome.tabs.create({ url: videoUrl(videoId, t) });
 }
 
 // --- the tab ---------------------------------------------------------------
@@ -187,17 +187,19 @@ function renderAnalyse() {
     items.push(sectionHeader("again", "Analyse"));
     items.push(pickerItem(p));
   }
-  if (state.threads.length) {
-    items.push(sectionHeader("done", "Done"));
-    for (const t of state.threads) {
-      items.push({ key: `t-${t.id}`, sig: JSON.stringify(t) + relTime(t.updated_at), build: () => buildThreadRow(t) });
-    }
-  }
+  // Waiting videos come before finished ones: analysing a new video is the
+  // common action here, and it shouldn't sit below a growing history.
   if (fresh.length) {
     items.push(sectionHeader("fresh", "Transcribed, not analysed"));
     for (const r of fresh) {
       if (p && p.videoId === r.video_id) items.push(pickerItem(p));
       else items.push({ key: `f-${r.video_id}`, sig: JSON.stringify([r.title, r.channel, r.duration]), build: () => buildFreshRow(r) });
+    }
+  }
+  if (state.threads.length) {
+    items.push(sectionHeader("done", "Done"));
+    for (const t of state.threads) {
+      items.push({ key: `t-${t.id}`, sig: JSON.stringify(t) + relTime(t.updated_at), build: () => buildThreadRow(t) });
     }
   }
   if (!items.length) {
@@ -419,6 +421,7 @@ function onScreenClosed(id) {
     ui.threadId = null;
     clearTimeout(ui.threadTimer);
   }
+  if (id === "channel") clearTimeout(ch.timer);     // channel.js: stop asking for a listing
 }
 
 function question(text) {

@@ -63,7 +63,12 @@ COLUMNS = [
     ("cancel_requested", "INTEGER"),
     ("notified_at", "TEXT"),        # background.js has shown its notification
     ("dismissed_at", "TEXT"),       # a failed analysis the user cleared away
+    ("requeued", "INTEGER"),        # batch: put back once after the worker died mid-job
 ]
+
+# Entry points of transcriptions queued as a batch: a channel pick in the
+# panel, or batch.py. Left alone for hours, so a crash requeues them.
+BATCH_ENTRIES = ("channel", "batch")
 
 # After the columns, for the reason store.py gives.
 INDEXES = [
@@ -126,18 +131,34 @@ def active_for(conn, video_id: str, kinds=TRANSCRIBE_KINDS):
     ).fetchone()
 
 
-def enqueue(conn, video_id: str, url: str, entry_point: str) -> int:
-    """A transcription. A video already queued or running is not queued twice."""
+def enqueue(conn, video_id: str, url: str, entry_point: str, meta: dict | None = None) -> int:
+    """
+    A transcription. A video already queued or running is not queued twice.
+    `meta` (title, channel, duration), when the caller already knows them —
+    a channel listing does — lets a queued row show its name and estimate.
+    """
+    meta = meta or {}
     with immediate(conn):
         existing = active_for(conn, video_id)
         if existing:
             return existing["id"]
         cur = conn.execute(
-            """INSERT INTO jobs (kind, video_id, url, entry_point, status, created_at)
-               VALUES ('transcribe', ?, ?, ?, 'queued', ?)""",
-            (video_id, url, entry_point, store.now()),
+            """INSERT INTO jobs (kind, video_id, url, entry_point, status, created_at,
+                                 title, channel, duration)
+               VALUES ('transcribe', ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+            (video_id, url, entry_point, store.now(),
+             meta.get("title"), meta.get("channel"), meta.get("duration")),
         )
         return cur.lastrowid
+
+
+def requeue(conn, job_id: int) -> None:
+    """A job orphaned by a dead worker, back to the queue — once."""
+    conn.execute(
+        "UPDATE jobs SET status = 'queued', stage = NULL, stage_started_at = NULL, "
+        "started_at = NULL, requeued = 1 WHERE id = ?",
+        (job_id,),
+    )
 
 
 def enqueue_analysis(conn, video_id: str, *, prompt: str | None = None,
@@ -158,11 +179,14 @@ def enqueue_analysis(conn, video_id: str, *, prompt: str | None = None,
             ).fetchone()
             if existing:
                 return existing["id"]
+        row = conn.execute("SELECT platform FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+        url = ("https://rutube.ru/video/{}/" if row and row["platform"] == "rutube"
+               else "https://www.youtube.com/watch?v={}").format(video_id)
         cur = conn.execute(
             """INSERT INTO jobs (kind, video_id, url, status, created_at,
                                  prompt, question, session_id)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)""",
-            (kind, video_id, f"https://www.youtube.com/watch?v={video_id}", store.now(),
+            (kind, video_id, url, store.now(),
              prompt, question, session_id),
         )
         return cur.lastrowid

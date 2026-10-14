@@ -11,10 +11,12 @@
 -- derived later for time-of-day metrics.
 
 CREATE TABLE IF NOT EXISTS videos (
-    video_id      TEXT PRIMARY KEY,          -- canonical 11-char id, the join key
+    video_id      TEXT PRIMARY KEY,          -- the join key: YouTube 11-char, RuTube 32-hex
+    platform      TEXT NOT NULL DEFAULT 'youtube',   -- 'youtube' | 'rutube'
     title         TEXT,
     channel       TEXT,
     duration      INTEGER,                   -- seconds
+    upload_date   TEXT,                      -- YYYY-MM-DD; NULL for rows from before it was stored
     first_seen_at TEXT NOT NULL,
     deleted_at    TEXT                       -- soft delete: files gone, row kept (see store.py)
 );

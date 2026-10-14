@@ -69,6 +69,13 @@ def _language(v):
     return v
 
 
+def _caption_language(v):
+    # Caption tracks can be regional ("pt-BR", "es-US"), unlike whisper's -l.
+    if v != "auto" and not (isinstance(v, str) and re.fullmatch(r"[a-z]{2,3}(-[A-Za-z]{2,4})?", v)):
+        raise ValueError('must be "auto" or a language code such as "en" or "pt-BR"')
+    return v
+
+
 def _text(v):
     if not isinstance(v, str) or not v.strip():
         raise ValueError("must be a non-empty string")
@@ -83,6 +90,7 @@ SPEC = {
     "language":          (_const("transcribe", "WHISPER_LANGUAGE"), _language),
     "vad_enabled":       (_const("transcribe", "WHISPER_VAD"), _bool),
     "vad_threshold":     (_const("transcribe", "WHISPER_VAD_THRESHOLD"), _optional(_number(0, 1))),
+    "caption_language":  (_const("transcribe", "CAPTION_LANGUAGE"), _caption_language),
     "min_coverage":      (_const("transcribe", "MIN_COVERAGE"), _number(0, 1)),
     "min_density":       (_const("transcribe", "MIN_DENSITY"), _number(0, 1)),
     "min_words_per_min": (_const("transcribe", "MIN_WORDS_PER_MIN"), _number(0)),

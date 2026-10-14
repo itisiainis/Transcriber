@@ -2,10 +2,10 @@
 transcribe.py — URL in, transcript out.
 
 Order of operations:
-  1. parse video id
-  2. fetch metadata (title, channel, duration) — no download
-  3. try caption tracks, in priority order, with quality checks
-  4. fall back to whisper.cpp on downloaded audio
+  1. parse the URL into (platform, video id)
+  2. fetch metadata (title, channel, duration, upload date) — no download
+  3. YouTube only: try caption tracks, in priority order, with quality checks
+  4. fall back to whisper.cpp on downloaded audio — the only path elsewhere
   5. return a uniform dict either way
 
 Run directly for testing:
@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -34,6 +35,8 @@ import settings
 MIN_COVERAGE = 0.85      # [setting] captions must reach this fraction of the runtime
 MIN_DENSITY = 0.20       # [setting] covered segment time / runtime; below this, suspect
 MIN_WORDS_PER_MIN = 20   # [setting] crude sanity check on caption volume
+CAPTION_LANGUAGE = "auto"    # [setting] caption_language: preferred caption track,
+                             # "auto" = the original audio's language
 
 WHISPER_EXE = Path("whisper/whisper-cli.exe")
 WHISPER_MODEL = Path("models/ggml-medium-q5_0.bin")     # [setting] whisper_model
@@ -61,48 +64,102 @@ KEEP_AUDIO = False       # True while debugging
 YTDLP_PROXY = None       # e.g. "socks5://127.0.0.1:1080"
 YTDLP_FORMAT = "bestaudio[protocol^=http]"   # avoid fragmented HLS
 
+# Sites besides YouTube: how to find the id, the URL yt-dlp is given, and
+# the download format. RuTube serves only HLS with the audio muxed into the
+# video, so it takes the smallest stream and ffmpeg keeps the sound. None of
+# them has captions: they go straight to whisper.
+PLATFORMS = {
+    "youtube": {
+        "hosts": ("youtube.com", "youtu.be"),
+        "url": "https://www.youtube.com/watch?v={}",
+        "format": YTDLP_FORMAT,
+    },
+    "rutube": {
+        "hosts": ("rutube.ru",),
+        "id": r"/(?:video|shorts|play/embed)/(?:private/)?([0-9a-f]{32})",
+        "url": "https://rutube.ru/video/{}/",
+        "format": "worst[acodec!=none]",
+    },
+}
+NO_CAPTIONS = "platform has no captions"   # a caption_reason, never a quality rejection
+
 # ---------------------------------------------------------------------------
 
 log = logging.getLogger("transcribe")
 
 
+def parse_url(url: str) -> tuple[str, str]:
+    """
+    URL -> (platform, video_id). A bare id works too: 11 characters is
+    YouTube's, 32 hex is RuTube's. They can't collide, so video_id stays the
+    one join key across platforms. An unknown site raises, naming the host.
+    """
+    url = url.strip()
+    if re.fullmatch(r"[0-9a-f]{32}", url):
+        return "rutube", url
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", url):
+        return "youtube", url
+
+    host = (urlparse(url if "//" in url else "//" + url).hostname or "").lower()
+    for platform, p in PLATFORMS.items():
+        if any(host == h or host.endswith("." + h) for h in p["hosts"]):
+            pattern = p.get("id", r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/|/live/)([0-9A-Za-z_-]{11})")
+            m = re.search(pattern, url)
+            if not m:
+                raise ValueError(f"no video id in: {url}")
+            return platform, m.group(1)
+    raise ValueError(f"unsupported site: {host or url}")
+
+
 def video_id(url: str) -> str:
-    """Pull the 11-char id out of any YouTube URL shape."""
-    patterns = [
-        r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/|/live/)([0-9A-Za-z_-]{11})",
-        r"^([0-9A-Za-z_-]{11})$",   # a bare id
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    raise ValueError(f"no video id in: {url}")
+    return parse_url(url)[1]
 
 
-def fetch_metadata(vid: str) -> dict:
-    """Title, channel, duration. No media downloaded."""
+def video_url(vid: str, platform: str = "youtube") -> str:
+    return PLATFORMS[platform]["url"].format(vid)
+
+
+def fetch_metadata(vid: str, platform: str = "youtube") -> dict:
+    """Title, channel, duration, upload date. No media downloaded."""
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     if YTDLP_PROXY:
         opts["proxy"] = YTDLP_PROXY
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+        info = ydl.extract_info(video_url(vid, platform), download=False)
+    d = info.get("upload_date")                # 'YYYYMMDD' or None
     return {
         "video_id": vid,
+        "platform": platform,
         "title": info.get("title"),
         "channel": info.get("uploader") or info.get("channel"),
         "duration": info.get("duration"),      # seconds
         "language": info.get("language"),      # often None
+        "upload_date": f"{d[:4]}-{d[4:6]}-{d[6:]}" if d else None,
     }
 
 
 # --- captions --------------------------------------------------------------
 
-def pick_track(vid: str, original_lang: str | None):
+def _base_lang(code: str) -> str:
+    """'en-US' -> 'en'. yt-dlp reports regional codes; tracks often don't."""
+    return code.split("-")[0].lower()
+
+
+def pick_track(vid: str, original_lang: str | list | None):
     """
     Preference order:
-      1. manual track in the video's own language
-      2. auto (ASR) track in the video's own language
+      1. manual track in the wanted language
+      2. auto (ASR) track in the wanted language
       3. nothing — translated tracks are deliberately ignored
+
+    `original_lang` may be a list of wanted languages, tried in order — the
+    caption_language setting first, then the video's own language.
+
+    Languages are matched on their base code. A video YouTube has auto-dubbed
+    carries one ASR track per dub language, and yt-dlp reports the original
+    as 'en-US' while the track is 'en'; an exact match then fails, and the
+    old fallback took the first track in the list — Arabic, transcribed from
+    an AI dub. Matching 'en-US' to 'en' picks the real audio's captions.
 
     Returns (track, kind) or (None, reason).
     """
@@ -120,14 +177,19 @@ def pick_track(vid: str, original_lang: str | None):
     if not native:
         return None, "only translated tracks"
 
-    # Which language is the video actually in? yt-dlp often doesn't say,
-    # so fall back to the language of the non-translated tracks.
-    langs = {t.language_code for t in native}
-    lang = original_lang if original_lang in langs else None
-    if lang is None:
-        # prefer a manual track's language, else whatever the ASR track is in
-        manual = [t for t in native if not t.is_generated]
-        lang = (manual[0] if manual else native[0]).language_code
+    # Wanted languages first, matched on base code ('en-US' finds 'en').
+    # Manual beats auto; among equals, the exact code beats a regional variant.
+    wanted = original_lang if isinstance(original_lang, list) else [original_lang]
+    for want in filter(None, wanted):
+        matching = [t for t in native if _base_lang(t.language_code) == _base_lang(want)]
+        if matching:
+            t = min(matching, key=lambda t: (t.is_generated, t.language_code != want))
+            return t, ("auto" if t.is_generated else "manual")
+
+    # No wanted language is available (or yt-dlp didn't say which the video
+    # is in): prefer a manual track's language, else whatever the ASR track is in.
+    manual = [t for t in native if not t.is_generated]
+    lang = (manual[0] if manual else native[0]).language_code
 
     for generated, kind in ((False, "manual"), (True, "auto")):
         for t in native:
@@ -175,7 +237,10 @@ def try_captions(meta: dict) -> dict:
     """
     vid, duration = meta["video_id"], meta["duration"]
 
-    track, kind = pick_track(vid, meta.get("language"))
+    # The chosen caption language if this video has it, else the original audio's.
+    preferred = settings.get("caption_language")
+    track, kind = pick_track(vid, [None if preferred == "auto" else preferred,
+                                   meta.get("language")])
     if track is None:
         log.info("captions: %s", kind)
         return {"accepted": False, "track": None, "quality": None, "reasons": [kind]}
@@ -222,14 +287,15 @@ def try_captions(meta: dict) -> dict:
 
 # --- whisper ---------------------------------------------------------------
 
-def download_audio(vid: str, dest: Path) -> Path:
+def download_audio(vid: str, dest: Path, platform: str = "youtube") -> Path:
     """16 kHz mono wav, which is what whisper.cpp wants."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     opts = {
-        "format": YTDLP_FORMAT,
+        "format": PLATFORMS[platform]["format"],
         "outtmpl": str(dest.with_suffix(".%(ext)s")),
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,     # HLS (RuTube) prints fragment progress even when quiet
         "retries": 20,
         "socket_timeout": 60,
         "postprocessors": [{
@@ -241,7 +307,7 @@ def download_audio(vid: str, dest: Path) -> Path:
     if YTDLP_PROXY:
         opts["proxy"] = YTDLP_PROXY
     with YoutubeDL(opts) as ydl:
-        ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+        ydl.download([video_url(vid, platform)])
     return dest.with_suffix(".wav")
 
 
@@ -409,13 +475,19 @@ def transcribe(url: str, on_progress=None) -> dict:
     t0 = time.perf_counter()
     timings = {}
 
-    meta = fetch_metadata(video_id(url))
+    platform, vid = parse_url(url)
+    meta = fetch_metadata(vid, platform)
     timings["metadata"] = round(time.perf_counter() - t0, 2)
     log.info("Video: %s (%ss)\nAuthor: %s", meta["title"], meta["duration"], meta["channel"])
 
-    t = time.perf_counter()
-    attempt = try_captions(meta)
-    timings["captions"] = round(time.perf_counter() - t, 2)
+    if platform == "youtube":
+        t = time.perf_counter()
+        attempt = try_captions(meta)
+        timings["captions"] = round(time.perf_counter() - t, 2)
+    else:
+        # Nothing was tried, so there is no quality to log and nothing rejected.
+        log.info("captions: %s", NO_CAPTIONS)
+        attempt = {"accepted": False, "track": None, "quality": None, "reasons": [NO_CAPTIONS]}
 
     # Recorded whether or not the captions were used.
     caption_attempt = {
@@ -429,7 +501,7 @@ def transcribe(url: str, on_progress=None) -> dict:
         result = attempt
     else:
         t = time.perf_counter()
-        wav = download_audio(meta["video_id"], AUDIO_DIR / meta["video_id"])
+        wav = download_audio(vid, AUDIO_DIR / vid, platform)
         timings["download"] = round(time.perf_counter() - t, 2)
         try:
             t = time.perf_counter()

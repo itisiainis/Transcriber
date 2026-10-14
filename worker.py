@@ -83,7 +83,9 @@ def record_failed(job, error: str, meta: dict) -> None:
             # Give the videos row its title even though the run failed, so the
             # failure is readable in the db and not just an id.
             store.upsert_video(conn, meta)
-        sub_id = store.record_failure(conn, job["video_id"], error, job["entry_point"])
+        import transcribe as tx
+        sub_id = store.record_failure(conn, job["video_id"], error, job["entry_point"],
+                                      tx.parse_url(job["url"])[0])
     with closing(jobs.connect()) as conn:
         jobs.fail(conn, job["id"], error, sub_id)
 
@@ -214,7 +216,13 @@ def recover_orphans(conn) -> None:
     for job in conn.execute("SELECT * FROM jobs WHERE status = 'running'").fetchall():
         log.warning("job %s was orphaned in stage %s", job["id"], job["stage"])
         error = "Interrupted: the worker stopped mid-job"
-        if job["kind"] in jobs.TRANSCRIBE_KINDS:
+        if (job["kind"] in jobs.TRANSCRIBE_KINDS and job["entry_point"] in jobs.BATCH_ENTRIES
+                and not job["requeued"]):
+            # A batch is left running for hours: a reboot shouldn't end it.
+            # Only once, so a video that kills the worker can't loop forever.
+            jobs.requeue(conn, job["id"])
+            log.info("job %s requeued", job["id"])
+        elif job["kind"] in jobs.TRANSCRIBE_KINDS:
             record_failed(job, error,
                           {"video_id": job["video_id"], "title": job["title"],
                            "channel": job["channel"], "duration": job["duration"]})

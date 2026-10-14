@@ -14,7 +14,7 @@ import sys
 
 import analyze as analyze_mod
 import store
-from transcribe import transcribe, summary, as_text, as_prose, video_id
+from transcribe import transcribe, summary, as_text, as_prose, parse_url
 
 
 def main() -> int:
@@ -36,7 +36,7 @@ def main() -> int:
 
     # Without an id there's no row to hang a failure on, so bail before the db.
     try:
-        vid = video_id(args.url)
+        platform, vid = parse_url(args.url)
     except ValueError as e:
         log.error("failed: %s", e)
         return 1
@@ -52,7 +52,7 @@ def main() -> int:
         try:
             result = transcribe(args.url)
         except Exception as e:
-            store.record_failure(conn, vid, f"{type(e).__name__}: {e}", args.entry)
+            store.record_failure(conn, vid, f"{type(e).__name__}: {e}", args.entry, platform)
             log.error("failed: %s", e)
             return 1
 

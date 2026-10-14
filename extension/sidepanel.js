@@ -87,7 +87,9 @@ const state = {
   worker: null,
   rows: [],
   unread: 0,
-  page: null,          // { videoId, title, channel } for the active tab, or null
+  page: null,          // { videoId, title, channel } or { channelUrl, title } for the active tab
+  selecting: false,    // multi-select mode on the Transcribe list
+  selected: new Set(), // video ids ticked in it
   transcript: null,    // the open transcript, if any
   transcriptId: null,  // the video whose transcript screen is showing
   threads: [],         // analyses, one per thread (analyse.js)
@@ -123,15 +125,37 @@ function rowFor(videoId) {
 
 // --- the video on the current tab -----------------------------------------
 
+// Mirrors transcribe.parse_url(): YouTube ids are 11 characters, RuTube's
+// 32 hex, so an id alone says which site it is.
 function videoIdFrom(url) {
   let u;
   try { u = new URL(url); } catch { return null; }
+  if (/(^|\.)rutube\.ru$/.test(u.hostname)) {
+    const m = u.pathname.match(/^\/(?:video|shorts|play\/embed)\/(?:private\/)?([0-9a-f]{32})/);
+    return m ? m[1] : null;
+  }
   const id11 = (s) => (s && /^[\w-]{11}$/.test(s) ? s : null);
   if (u.hostname === "youtu.be") return id11(u.pathname.slice(1, 12));
   if (!/(^|\.)youtube\.com$/.test(u.hostname)) return null;
   if (u.pathname === "/watch") return id11(u.searchParams.get("v"));
   const m = u.pathname.match(/^\/(?:shorts|live|embed|v)\/([\w-]{11})/);
   return m ? m[1] : null;
+}
+
+// Mirrors channel.parse_channel(): a channel page, whose videos can be listed.
+function channelFrom(url) {
+  let u;
+  try { u = new URL(url); } catch { return null; }
+  if (/(^|\.)rutube\.ru$/.test(u.hostname)) {
+    return /^\/(channel\/\d+|u\/\w+)/.test(u.pathname) ? url : null;
+  }
+  if (!/(^|\.)youtube\.com$/.test(u.hostname)) return null;
+  return /^\/(@[^/]+|channel\/UC[\w-]{22}|c\/[^/]+|user\/[^/]+)/.test(u.pathname) ? url : null;
+}
+
+function videoUrl(videoId, t) {
+  if (/^[0-9a-f]{32}$/.test(videoId)) return `https://rutube.ru/video/${videoId}/` + (t ? `?t=${t}` : "");
+  return `https://www.youtube.com/watch?v=${videoId}` + (t ? `&t=${t}s` : "");
 }
 
 // Runs inside the YouTube page. Tab titles lag behind YouTube's in-page
@@ -150,13 +174,16 @@ let windowId = null;
 async function detectPage() {
   const [tab] = await chrome.tabs.query({ active: true, windowId: windowId ?? chrome.windows.WINDOW_ID_CURRENT });
   const videoId = tab && videoIdFrom(tab.url || "");
+  // Fall back to the tab title ("(3) Title - YouTube") until the page answers.
+  // RuTube's page has no YouTube markup, so its title is all there is.
+  const fallback = (tab?.title || "").replace(/^\(\d+\)\s*/, "").replace(/\s*-\s*YouTube$/, "")
+    .replace(/\s+[—–-]\s+смотреть.*$/i, "").replace(/\s*[|—–-]\s*RUTUBE$/i, "");
   if (!videoId) {
-    state.page = null;
+    const channelUrl = tab && channelFrom(tab.url || "");
+    state.page = channelUrl ? { channelUrl, title: fallback || null } : null;
     render();
     return;
   }
-  // Fall back to the tab title ("(3) Title - YouTube") until the page answers.
-  const fallback = (tab.title || "").replace(/^\(\d+\)\s*/, "").replace(/\s*-\s*YouTube$/, "");
   let info = {};
   try {
     const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: readPageVideo });
@@ -215,10 +242,20 @@ function fmtDuration(s) {
   return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
 
+// "~4h 20m" — the same rounding as batch.fmt_estimate().
+function fmtEstimate(s) {
+  if (s == null) return null;
+  const m = Math.round(s / 60);
+  if (m < 1) return "<1m";
+  return m >= 60 ? `~${Math.floor(m / 60)}h ${m % 60}m` : `~${m}m`;
+}
+
 function render() {
   renderIntake();
   renderWorker();
+  renderSelectBar();
   renderRows();
+  if (typeof renderChannel === "function") renderChannel();
   const badge = $("unread");
   badge.textContent = state.unread;
   badge.hidden = !state.unread;
@@ -231,7 +268,13 @@ function renderIntake() {
   if (!p) {
     btn.disabled = true;
     label.textContent = "Transcribe video on page";
-    text.textContent = "Open a YouTube video to transcribe it from here";
+    text.textContent = "Open a YouTube or RuTube video to transcribe it from here";
+    return;
+  }
+  if (p.channelUrl) {
+    btn.disabled = !state.connected;
+    label.textContent = "Show this channel's videos";
+    text.textContent = p.title || "Channel";
     return;
   }
   text.textContent = [p.title || p.videoId, p.channel].filter(Boolean).join(" — ");
@@ -316,9 +359,136 @@ function el(tag, cls, text) {
   return e;
 }
 
+// --- multi-select ------------------------------------------------------------
+//
+// Entered from the Select button or a right-click on a row (never a
+// long-press: that is a touch idiom and fights text selection). Covers
+// export and delete alike. Rows still queued or running can't be ticked.
+
+const selectable = (r) => r.state !== "running" && r.state !== "queued";
+const selectedRows = () => state.rows.filter((r) => state.selected.has(r.video_id));
+// Oldest first in an export: the order they were transcribed.
+const selectedExportable = () => selectedRows().filter((r) => r.has_transcript).reverse();
+
+function startSelect(videoId) {
+  state.selecting = true;
+  if (videoId) state.selected.add(videoId);
+  render();
+}
+
+function stopSelect() {
+  state.selecting = false;
+  state.selected.clear();
+  showSelError("");
+  disarm($("sel-delete"));
+  render();
+}
+
+function toggleSelect(videoId) {
+  if (state.selected.has(videoId)) state.selected.delete(videoId);
+  else state.selected.add(videoId);
+  disarm($("sel-delete"));
+  render();
+}
+
+function showSelError(msg) {
+  $("sel-error").textContent = msg;
+  $("sel-error").hidden = !msg;
+}
+
+function renderSelectBar() {
+  $("select-btn").hidden = state.selecting || !state.connected || !state.rows.length;
+  $("select-bar").hidden = !state.selecting;
+  if (!state.selecting) return;
+  for (const id of state.selected) if (!rowFor(id)) state.selected.delete(id);
+  const n = state.selected.size, exportable = selectedExportable().length;
+  $("select-count").textContent = n ? `${n} selected` : "Tick videos to export or delete";
+  for (const id of ["sel-export", "sel-export-zip"]) {
+    $(id).disabled = !exportable;
+    $(id).title = exportable < n ? `${n - exportable} without a transcript will be left out` : "";
+  }
+  $("sel-delete").disabled = !n;
+}
+
+function saveFile(blob, filename) {
+  const a = Object.assign(document.createElement("a"), {
+    href: URL.createObjectURL(blob),
+    download: filename.replace(/[\\/:*?"<>|]+/g, " ").trim(),
+  });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// export.py builds the file; it arrives as base64 in parts (1 MB message cap).
+async function exportSelected(mode, btn) {
+  const ids = selectedExportable().map((r) => r.video_id);
+  if (!ids.length) return;
+  showSelError("");
+  btn.disabled = true;
+  try {
+    const parts = await host.call("export", { video_ids: ids, mode });
+    const list = Array.isArray(parts) ? parts : [parts];
+    const bin = atob(list.map((p) => p.data).join(""));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    saveFile(new Blob([bytes], { type: list[0].mime }), list[0].filename);
+    flash(btn, "Saved");
+  } catch (e) {
+    showSelError(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteSelected() {
+  const failed = new Map();     // video id -> why; those stay ticked
+  for (const r of selectedRows()) {
+    try { await host.call("delete_video", { video_id: r.video_id }); }
+    catch (e) { failed.set(r.video_id, `${r.title || r.video_id}: ${e.message}`); }
+  }
+  if (failed.size) {
+    state.selected = new Set(failed.keys());
+    showSelError([...failed.values()].join("\n"));
+  } else {
+    stopSelect();
+  }
+  refresh();
+}
+
+function buildSelectRow(li, r) {
+  const ok = selectable(r);
+  const box = el("input", "pick-box");
+  box.type = "checkbox";
+  box.tabIndex = -1;
+  box.checked = state.selected.has(r.video_id);
+  box.disabled = !ok;
+  const body = el("div", "body");
+  body.append(el("div", "title", r.title || r.video_id),
+    el("div", "sub", [r.channel, fmtDuration(r.duration),
+      r.has_transcript ? r.source : r.state === "failed" ? "failed" : r.state].filter(Boolean).join(" · ")));
+  li.append(box, body, el("span"));
+  li.classList.add("picking");
+  li.classList.toggle("picked", box.checked);
+  if (ok) {
+    li.tabIndex = 0;
+    li.addEventListener("click", () => toggleSelect(r.video_id));
+    li.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleSelect(r.video_id); }
+    });
+  }
+  return li;
+}
+
 function buildRow(r) {
   const li = el("li", `row ${r.state}`);
   li.dataset.id = r.video_id;
+  li.addEventListener("contextmenu", (e) => {
+    if (!selectable(r)) return;
+    e.preventDefault();
+    if (state.selecting) toggleSelect(r.video_id);
+    else startSelect(r.video_id);
+  });
+  if (state.selecting) return buildSelectRow(li, r);
 
   const glyph = el("span", "glyph");
   const body = el("div", "body");
@@ -339,7 +509,8 @@ function buildRow(r) {
     li.append(bar);
   } else if (r.state === "queued") {
     glyph.classList.add("plain");
-    sub.textContent = r.queue_position > 1 ? `queued · ${r.queue_position} in line` : "queued · next up";
+    sub.textContent = [r.queue_position > 1 ? `queued · ${r.queue_position} in line` : "queued · next up",
+      fmtEstimate(r.estimate)].filter(Boolean).join(" · ");
     li.append(el("span"));
   } else if (r.state === "failed") {
     glyph.classList.add("bad");
@@ -384,7 +555,8 @@ function renderRows() {
   for (const r of state.rows) {
     seen.add(r.video_id);
     const { progress, ...stable } = r;
-    const sig = JSON.stringify({ ...stable, stage: progress?.stage });
+    const sig = JSON.stringify({ ...stable, stage: progress?.stage,
+      selecting: state.selecting, picked: state.selected.has(r.video_id) });
     let cached = rowCache.get(r.video_id);
     if (!cached || cached.sig !== sig) {
       const node = buildRow(r);
@@ -405,7 +577,7 @@ function renderRows() {
 
 function tick() {
   for (const c of rowCache.values()) {
-    if (!c.progress) continue;
+    if (!c.progress || state.selecting) continue;
     c.node.querySelector(".progress-text").textContent = progressText(c.progress);
     const bar = c.node.querySelector(".bar");
     const { frac } = estimate(c.progress);
@@ -578,10 +750,11 @@ for (const b of document.querySelectorAll(".tab")) {
 $("page-btn").addEventListener("click", async () => {
   const p = state.page;
   if (!p) return;
+  if (p.channelUrl) return openChannel(p.channelUrl, p.title);
   const row = rowFor(p.videoId);
   if (row && row.state === "done" && row.has_transcript) return openTranscript(p.videoId);
   $("page-btn").disabled = true;
-  await submit(`https://www.youtube.com/watch?v=${p.videoId}`, "page");
+  await submit(videoUrl(p.videoId), "page");
 });
 
 $("link-form").addEventListener("submit", async (e) => {
@@ -589,11 +762,13 @@ $("link-form").addEventListener("submit", async (e) => {
   const input = $("link-input");
   const url = input.value.trim();
   if (!url) return;
-  if (!videoIdFrom(url) && !/^[\w-]{11}$/.test(url)) {
-    showLinkError("That isn't a YouTube link");
-    return;
-  }
+  // Which sites work is the host's call (transcribe.parse_url); its error
+  // names the site that isn't supported.
   showLinkError("");
+  if (channelFrom(url) && !videoIdFrom(url)) {
+    input.value = "";
+    return openChannel(url);
+  }
   if (await submit(url, "link")) input.value = "";
 });
 $("link-input").addEventListener("input", () => showLinkError(""));
@@ -612,20 +787,22 @@ $("settings-open").addEventListener("click", () => openSettings());
 $("tr-download").addEventListener("click", (e) => {
   const t = state.transcript;
   if (!t) return;
-  const blob = new Blob([transcriptText()], { type: "text/plain;charset=utf-8" });
-  const a = Object.assign(document.createElement("a"), {
-    href: URL.createObjectURL(blob),
-    download: `${(t.title || t.video_id).replace(/[\\/:*?"<>|]+/g, " ").trim()}.txt`,
-  });
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  saveFile(new Blob([transcriptText()], { type: "text/plain;charset=utf-8" }), `${t.title || t.video_id}.txt`);
   flash(e.currentTarget, "Saved");
 });
+
+$("select-btn").addEventListener("click", () => startSelect());
+$("sel-done").addEventListener("click", stopSelect);
+$("sel-export").addEventListener("click", (e) => exportSelected("combined", e.currentTarget));
+$("sel-export-zip").addEventListener("click", (e) => exportSelected("separate", e.currentTarget));
+confirmTwice($("sel-delete"), () => `Delete ${state.selected.size}?`, deleteSelected);
 // The one clay control on a blue screen: it hands the video to Analyse.
 $("tr-analyse").addEventListener("click", () => startAnalyse(state.transcriptId));
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && screenStack.length) closeScreen(screenStack.at(-1));
+  if (e.key !== "Escape") return;
+  if (screenStack.length) closeScreen(screenStack.at(-1));
+  else if (state.selecting) stopSelect();
 });
 
 chrome.tabs.onActivated.addListener((info) => { if (info.windowId === windowId) detectPage(); });

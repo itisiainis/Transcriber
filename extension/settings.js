@@ -11,10 +11,11 @@ const SETTINGS = [
       { key: "whisper_model", label: "Whisper model", type: "model" },
       { key: "whisper_threads", label: "CPU threads", type: "number", min: 1, max: 64, step: 1 },
       {
-        key: "language", label: "Spoken language", type: "select",
+        key: "language", label: "Whisper language", type: "select",
         options: [["auto", "Detect automatically"], ["ru", "Russian"], ["en", "English"],
                   ["uk", "Ukrainian"], ["de", "German"], ["fr", "French"], ["es", "Spanish"]],
-        hint: "Setting it skips detection, which can misfire on a short or musical intro.",
+        hint: "The language whisper listens for. Setting it skips detection, which can "
+          + "misfire on a short or musical intro.",
       },
       { key: "vad_enabled", label: "Skip silence and music (VAD)", type: "toggle" },
       {
@@ -25,9 +26,17 @@ const SETTINGS = [
     ],
   },
   {
-    title: "Caption quality",
-    note: "Captions are used only if all three pass; otherwise the audio goes to whisper.",
+    title: "Captions",
+    note: "Captions are used only if all three quality checks pass; otherwise the audio goes to whisper.",
     fields: [
+      {
+        key: "caption_language", label: "Caption language", type: "select",
+        options: [["auto", "Original audio"], ["en", "English"], ["ru", "Russian"],
+                  ["uk", "Ukrainian"], ["de", "German"], ["fr", "French"], ["es", "Spanish"]],
+        hint: "Which captions to take when a video has several — YouTube adds one per "
+          + "auto-dubbed language. If the video has none in this language, the original "
+          + "audio's captions are used.",
+      },
       { key: "min_coverage", label: "Minimum coverage", type: "number", min: 0, max: 1, step: 0.05,
         hint: "How close to the end of the video the captions must reach (0–1)." },
       { key: "min_density", label: "Minimum density", type: "number", min: 0, max: 1, step: 0.05,
