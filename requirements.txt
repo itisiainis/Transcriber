@@ -1,0 +1,4 @@
+# yt-dlp: не ниже этой версии — YouTube и RuTube регулярно ломают старые
+yt-dlp>=2026.8.19
+# 1.x: API через экземпляр (YouTubeTranscriptApi().list), на нём держится pick_track()
+youtube-transcript-api==1.2.4

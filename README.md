@@ -1,6 +1,6 @@
 # Transcriber
 
-Личный инструмент: YouTube-видео → текст → разбор через Claude. Всё это
+Личный инструмент: видео с YouTube или RuTube → текст → разбор через Claude. Всё это
 работает из боковой панели Chrome, а каждый запуск записывается в SQLite.
 
 ## Зачем
@@ -52,6 +52,9 @@ whisper.cpp (CPU, BLAS). Сегменты с низкой уверенность
 | `transcribe.py` | URL → расшифровка (субтитры / whisper.cpp) |
 | `analyze.py` | запуск Claude Code с промптом, уточняющие вопросы |
 | `run.py` | CLI: расшифровать, сохранить, по желанию разобрать |
+| `channel.py` | список видео канала (YouTube, RuTube) |
+| `batch.py` | несколько расшифровок в очереди, оценка времени |
+| `export.py` | расшифровки в .txt или zip с заголовком |
 | `store.py`, `schema.sql` | SQLite и миграции |
 | `settings.py` | настройки в базе, константы в модулях служат значениями по умолчанию |
 | `jobs.py`, `worker.py` | очередь задач и фоновый воркер |
@@ -60,21 +63,59 @@ whisper.cpp (CPU, BLAS). Сегменты с низкой уверенность
 | `prompts/*.md` | промпты для разбора: summary, factcheck, worth-watching |
 | `data_analysis.ipynb` | анализ собранных данных |
 
-## Запуск
+## Установка на новый компьютер (Windows)
 
-Нужны Python 3 с `yt-dlp` и `youtube-transcript-api`, сборка whisper.cpp
-в `whisper/`, модель `ggml-*.bin` в `models/` и установленный Claude Code
-(`claude` в PATH).
+Всё, кроме самой панели, работает локально, поэтому на каждом компьютере
+нужна своя копия проекта целиком.
+
+1. **Код и зависимости** (нужны Python 3 и Git):
+   ```
+   git clone git@github.com:itisiainis/Transcriber.git C:\projects\Transcriber
+   cd C:\projects\Transcriber
+   python -m venv .venv
+   .venv\Scripts\pip install -r requirements.txt
+   winget install ffmpeg
+   ```
+   ffmpeg нужен для скачивания аудио. После установки откройте новый
+   терминал, чтобы он появился в PATH.
+
+2. **Что не хранится в git.** Скопируйте с другого компьютера:
+   - `whisper\`: сборка whisper.cpp (`whisper-cli.exe` и её dll);
+   - `models\`: `ggml-medium-q5_0.bin` и `ggml-silero-v6.2.0.bin` (VAD).
+
+   Или скачайте их заново: модели лежат на huggingface.co/ggerganov/whisper.cpp
+   и huggingface.co/ggml-org/whisper-vad.
+
+3. **Claude Code** установлен и залогинен (`claude` в PATH). Он нужен
+   только для разборов: расшифровка работает и без него.
+
+4. **Панель в Chrome:**
+   ```
+   powershell -ExecutionPolicy Bypass -File host\install.ps1
+   ```
+   Затем `chrome://extensions` → режим разработчика → «Загрузить
+   распакованное» → папка `extension\`. ID расширения задан ключом в
+   `manifest.json` и одинаков на всех компьютерах, а install.ps1
+   прописывает в реестр путь именно этой копии. Если папку проекта
+   перенесли, запустите его ещё раз.
+
+5. **Проверка:** `.venv\Scripts\python run.py <ссылка на видео>`. В панели
+   внизу должно быть «Worker online».
+
+У каждого компьютера свои база (`transcriber.db`), расшифровки и разборы:
+они не синхронизируются и в репозиторий не попадают. Чтобы перенести
+историю, скопируйте `transcriber.db`, `transcripts\` и `analyses\`. После
+этого копии начнут расходиться. На слабом процессоре уменьшите «CPU threads»
+в настройках панели.
+
+## Команды
 
 ```
 python run.py <url> [--prompt factcheck | --ask "вопрос"]
 python analyze.py last --more "уточняющий вопрос"
 python settings.py                      # текущие настройки
+python channel.py <ссылка на канал>     # список видео канала
+python batch.py add <видео или канал>... [--limit N]
+python batch.py list | run | clear      # очередь: оценка времени, запуск, очистка
+python export.py --last 3               # расшифровки в .txt (--mode separate → zip)
 ```
-
-Панель:
-
-1. `chrome://extensions` → режим разработчика → «Загрузить распакованное» → `extension/`
-2. `powershell -ExecutionPolicy Bypass -File host\install.ps1`
-
-Расшифровки, аудио, разборы и база в репозиторий не попадают.
