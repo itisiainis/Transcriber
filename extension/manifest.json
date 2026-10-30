@@ -11,7 +11,7 @@
     "128": "icons/icon128.png"
   },
   "permissions": ["sidePanel", "nativeMessaging", "tabs", "scripting", "notifications", "storage"],
-  "host_permissions": ["https://www.youtube.com/*", "https://m.youtube.com/*", "https://rutube.ru/*"],
+  "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "side_panel": { "default_path": "sidepanel.html" },
   "action": {

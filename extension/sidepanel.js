@@ -16,6 +16,8 @@ const ICON = {
   alert: '<svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="8.2"/><path d="M10 5.8v5"/><circle cx="10" cy="14" r=".4" class="fill" style="stroke:currentColor"/></svg>',
   spin: '<svg viewBox="0 0 22 22"><circle class="track" cx="11" cy="11" r="8.5"/><path class="arc" d="M11 2.5a8.5 8.5 0 0 1 8.5 8.5"/></svg>',
   ok: '<svg viewBox="0 0 16 16"><path d="m3.5 8.5 3 3 6-7"/></svg>',
+  hide: '<svg viewBox="0 0 16 16"><path d="M1.8 8S4 4 8 4s6.2 4 6.2 4-2.2 4-6.2 4S1.8 8 1.8 8z"/><circle cx="8" cy="8" r="1.8"/><path d="M2.5 13.5 13.5 2.5"/></svg>',
+  show: '<svg viewBox="0 0 16 16"><path d="M1.8 8S4 4 8 4s6.2 4 6.2 4-2.2 4-6.2 4S1.8 8 1.8 8z"/><circle cx="8" cy="8" r="1.8"/></svg>',
 };
 
 // --- host connection -------------------------------------------------------
@@ -90,6 +92,7 @@ const state = {
   page: null,          // { videoId, title, channel } or { channelUrl, title } for the active tab
   selecting: false,    // multi-select mode on the Transcribe list
   selected: new Set(), // video ids ticked in it
+  showHidden: false,   // the Transcribe list includes rows hidden to save scrolling
   transcript: null,    // the open transcript, if any
   transcriptId: null,  // the video whose transcript screen is showing
   threads: [],         // analyses, one per thread (analyse.js)
@@ -154,6 +157,7 @@ function channelFrom(url) {
 }
 
 function videoUrl(videoId, t) {
+  if (/^r[0-9a-f]{15}$/.test(videoId)) return null;     // recorded in the panel: no page to seek in
   if (/^[0-9a-f]{32}$/.test(videoId)) return `https://rutube.ru/video/${videoId}/` + (t ? `?t=${t}` : "");
   return `https://www.youtube.com/watch?v=${videoId}` + (t ? `&t=${t}s` : "");
 }
@@ -359,6 +363,32 @@ function el(tag, cls, text) {
   return e;
 }
 
+// --- hiding ------------------------------------------------------------------
+//
+// Hiding only shortens the lists: the transcript, its analyses and every log
+// row stay (store.set_hidden). A hidden video is out of the Transcribe list
+// and "Transcribed, not analysed"; a hidden thread is out of "Done". Each
+// list ends with "Show hidden (N)" to get them back. Rows that are queued or
+// running are never hidden — they are the ones you are waiting on.
+
+async function setHidden(args, hidden) {
+  try { await host.call("hide", { ...args, hidden }); }
+  catch (e) { showLinkError(e.message); }
+  refresh();
+}
+
+const isHidden = (r) => r.hidden && r.state !== "running" && r.state !== "queued";
+const visibleRows = () => state.rows.filter((r) => state.showHidden || !isHidden(r));
+
+function hideButton(hidden, onClick) {
+  const b = el("button", "icon-btn small hide-btn");
+  b.innerHTML = hidden ? ICON.show : ICON.hide;
+  b.title = hidden ? "Show in the list again" : "Hide from the list — nothing is deleted";
+  b.setAttribute("aria-label", b.title);
+  b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
+  return b;
+}
+
 // --- multi-select ------------------------------------------------------------
 //
 // Entered from the Select button or a right-click on a row (never a
@@ -366,7 +396,7 @@ function el(tag, cls, text) {
 // export and delete alike. Rows still queued or running can't be ticked.
 
 const selectable = (r) => r.state !== "running" && r.state !== "queued";
-const selectedRows = () => state.rows.filter((r) => state.selected.has(r.video_id));
+const selectedRows = () => visibleRows().filter((r) => state.selected.has(r.video_id));
 // Oldest first in an export: the order they were transcribed.
 const selectedExportable = () => selectedRows().filter((r) => r.has_transcript).reverse();
 
@@ -408,6 +438,10 @@ function renderSelectBar() {
     $(id).title = exportable < n ? `${n - exportable} without a transcript will be left out` : "";
   }
   $("sel-delete").disabled = !n;
+  // Hide when anything ticked is showing; Unhide when all of it is hidden.
+  const allHidden = n > 0 && selectedRows().every((r) => r.hidden);
+  $("sel-hide").disabled = !n;
+  $("sel-hide").querySelector("span").textContent = allHidden ? "Unhide" : "Hide";
 }
 
 function saveFile(blob, filename) {
@@ -530,6 +564,9 @@ function buildRow(r) {
     if (r.analysed) { glyph.classList.add("analysed"); glyph.innerHTML = ICON.check; }
     else glyph.classList.add("plain");
     sub.textContent = [r.channel, fmtDuration(r.duration), r.source].filter(Boolean).join(" · ");
+    if (r.hidden) li.classList.add("is-hidden");
+    const end = el("span", "row-end");      // one grid cell: the eye, then the chevron
+    end.append(hideButton(r.hidden, () => setHidden({ video_ids: [r.video_id] }, !r.hidden)));
     const chev = el("span", "chev");
     if (r.has_transcript) {
       chev.innerHTML = ICON.chev;
@@ -538,7 +575,8 @@ function buildRow(r) {
       li.addEventListener("click", () => openTranscript(r.video_id));
       li.addEventListener("keydown", (e) => { if (e.key === "Enter") openTranscript(r.video_id); });
     }
-    li.append(chev);
+    end.append(chev);
+    li.append(end);
   }
   return li;
 }
@@ -549,10 +587,15 @@ const rowCache = new Map();   // video_id -> { sig, node }
 
 function renderRows() {
   const list = $("rows");
-  $("empty").hidden = !state.connected || state.rows.length > 0;
+  const rows = visibleRows();
+  $("empty").hidden = !state.connected || rows.length > 0;
+  const hiddenCount = state.rows.filter(isHidden).length;
+  const toggle = $("show-hidden");
+  toggle.hidden = !hiddenCount;
+  toggle.textContent = state.showHidden ? "Hide hidden" : `Show hidden (${hiddenCount})`;
   const seen = new Set();
   let prev = null;
-  for (const r of state.rows) {
+  for (const r of rows) {
     seen.add(r.video_id);
     const { progress, ...stable } = r;
     const sig = JSON.stringify({ ...stable, stage: progress?.stage,
@@ -792,6 +835,13 @@ $("tr-download").addEventListener("click", (e) => {
 });
 
 $("select-btn").addEventListener("click", () => startSelect());
+$("show-hidden").addEventListener("click", () => { state.showHidden = !state.showHidden; render(); });
+$("sel-hide").addEventListener("click", async () => {
+  const picked = selectedRows();
+  const hide = !picked.every((r) => r.hidden);
+  await setHidden({ video_ids: picked.map((r) => r.video_id) }, hide);
+  stopSelect();
+});
 $("sel-done").addEventListener("click", stopSelect);
 $("sel-export").addEventListener("click", (e) => exportSelected("combined", e.currentTarget));
 $("sel-export-zip").addEventListener("click", (e) => exportSelected("separate", e.currentTarget));

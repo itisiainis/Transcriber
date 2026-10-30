@@ -83,6 +83,10 @@ def migrate(conn) -> None:
         # right for them. upload_date is not backfilled: older rows stay NULL.
         ("videos", "platform", "TEXT NOT NULL DEFAULT 'youtube'"),
         ("videos", "upload_date", "TEXT"),
+        # Hidden from the panel's lists to save scrolling. Not a delete:
+        # files stay, and nothing that measures behaviour reads it.
+        ("videos", "hidden_at", "TEXT"),
+        ("analyses", "hidden_at", "TEXT"),
     ]
     for table, column, coltype in wanted:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -146,7 +150,8 @@ def upsert_video(conn, result: dict) -> None:
             channel = excluded.channel,
             duration = excluded.duration,
             upload_date = COALESCE(excluded.upload_date, upload_date),
-            deleted_at = NULL
+            deleted_at = NULL,
+            hidden_at = NULL
         """,
         (result["video_id"], result.get("platform", "youtube"), result["title"],
          result["channel"], result["duration"], result.get("upload_date"), now()),
@@ -212,7 +217,7 @@ def record_failure(conn, video_id: str, error: str, entry_point: str = "link",
         (video_id, platform, now()),
     )
     # A retry of a deleted video is a new submission: show it again.
-    conn.execute("UPDATE videos SET deleted_at = NULL WHERE video_id = ?", (video_id,))
+    conn.execute("UPDATE videos SET deleted_at = NULL, hidden_at = NULL WHERE video_id = ?", (video_id,))
     cur = conn.execute(
         """INSERT INTO submissions (video_id, submitted_at, entry_point, status, error)
            VALUES (?, ?, ?, 'failed', ?)""",
@@ -277,6 +282,19 @@ def set_verdict(conn, analysis_id: int, verdict: str) -> None:
 # transcript/analysis files and sets deleted_at; the UI's reads skip those
 # rows, and every metric query still sees them. purge() is the one exception.
 
+def set_hidden(conn, *, video_ids=(), analysis_id: int | None = None, hidden: bool = True) -> None:
+    """
+    Hide from the panel's lists, or bring back. Only for scrolling: a hidden
+    video keeps its transcript and analyses, and submitting it again shows
+    it again (upsert_video). Hiding an analysis hides its thread in "Done".
+    """
+    at = now() if hidden else None
+    for vid in video_ids:
+        conn.execute("UPDATE videos SET hidden_at = ? WHERE video_id = ?", (at, vid))
+    if analysis_id is not None:
+        conn.execute("UPDATE analyses SET hidden_at = ? WHERE id = ?", (at, analysis_id))
+
+
 def soft_delete_video(conn, video_id: str) -> dict:
     """
     Hide a video: set deleted_at, remove transcripts/<id>.json and the whole
@@ -295,6 +313,10 @@ def soft_delete_video(conn, video_id: str) -> dict:
     if folder.is_dir():
         removed += [str(p) for p in sorted(folder.rglob("*")) if p.is_file()]
         shutil.rmtree(folder)
+    # A recording's audio is a file like any other (recording.py).
+    import recording
+    if recording.ID_RE.fullmatch(video_id) and recording.remove(video_id):
+        removed.append(str(recording.RECORD_DIR / video_id))
     return {"video_id": video_id, "removed_files": removed}
 
 

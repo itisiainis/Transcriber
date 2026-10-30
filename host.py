@@ -52,6 +52,7 @@ import batch
 import channel
 import export
 import jobs
+import recording
 import settings
 import store
 import transcribe as tx
@@ -189,7 +190,7 @@ def source_label(source: str | None) -> str | None:
 def build_rows(conn) -> list[dict]:
     videos = conn.execute(
         """
-        SELECT v.video_id, v.platform, v.title, v.channel, v.duration, v.first_seen_at,
+        SELECT v.video_id, v.platform, v.title, v.channel, v.duration, v.first_seen_at, v.hidden_at,
                s.status, s.error, s.source, s.entry_point,
                (SELECT COUNT(*) FROM analyses a WHERE a.video_id = v.video_id
                                                AND a.deleted_at IS NULL) AS n_analyses,
@@ -218,6 +219,7 @@ def build_rows(conn) -> list[dict]:
         rows[vid] = {
             "video_id": vid,
             "platform": v["platform"],
+            "hidden": v["hidden_at"] is not None,
             "title": v["title"] or (last_job and last_job["title"]),
             "channel": v["channel"] or (last_job and last_job["channel"]),
             "duration": v["duration"] or (last_job and last_job["duration"]),
@@ -403,6 +405,51 @@ def cmd_export(conn, msg):
             for i, c in enumerate(chunks)]
 
 
+# --- recording -------------------------------------------------------------
+#
+# The extension records; these only put the bytes on disk (recording.py).
+# They come from background.js's own port, not the panel's: a recording
+# must outlive the panel being closed.
+
+def cmd_rec_start(conn, msg) -> dict:
+    rec_id = recording.start(msg.get("title"), msg.get("page_url"), msg.get("source"),
+                             bool(msg.get("live")))
+    s = settings.all()
+    log.info("recording %s started: %s", rec_id, msg.get("page_url"))
+    return {"rec_id": rec_id, "bitrate": recording.BITRATE,
+            "silence_stop": s["record_silence_stop"],
+            "silence_stop_live": s["record_silence_stop_live"]}
+
+
+def cmd_rec_chunk(conn, msg) -> dict:
+    data = base64.b64decode(msg.get("data") or "")
+    return {"bytes": recording.append(msg.get("rec_id") or "", int(msg.get("seg") or 0), data)}
+
+
+def cmd_rec_stop(conn, msg) -> dict:
+    """Joins the segments and queues the transcription, like any video."""
+    rec_id = msg.get("rec_id") or ""
+    m = recording.finish(rec_id, msg.get("reason"))
+    log.info("recording %s finished (%s): %ss", rec_id, m.get("reason"), m.get("duration"))
+    out = {"duration": m.get("duration"), "bytes": m.get("bytes"),
+           "path": str(recording.audio_path(rec_id)).replace("\\", "/")}
+    if msg.get("transcribe", True):
+        out["job_id"] = jobs.enqueue(
+            conn, rec_id, f"recording:{rec_id}", "record",
+            {"title": m.get("title"), "channel": m.get("site"),
+             "duration": int(m["duration"]) if m.get("duration") else None})
+        ensure_worker(conn)
+    return out
+
+
+def cmd_rec_discard(conn, msg) -> dict:
+    """Thrown away: the folder goes, nothing is transcribed, no row is written."""
+    rec_id = msg.get("rec_id") or ""
+    recording.remove(rec_id)
+    log.info("recording %s discarded", rec_id)
+    return {}
+
+
 # --- the Analyse side ------------------------------------------------------
 
 VERDICTS = ("watched", "partial", "skipped")
@@ -436,6 +483,7 @@ def build_threads(conn) -> list[dict]:
                 "duration_s": r["duration_s"], "verdict": r["verdict"],
                 "unread": r["opened_at"] is None, "followups": 0,
                 "resumable": bool(r["session_id"]),
+                "hidden": r["hidden_at"] is not None,
             }
             threads[r["id"]] = t
             if r["session_id"]:
@@ -686,6 +734,17 @@ def cmd_watch(conn, msg) -> dict:
     return {"active": active, "finished": finished}
 
 
+# --- hiding ----------------------------------------------------------------
+
+def cmd_hide(conn, msg) -> dict:
+    """Videos by id, or one analysis thread; hidden=false brings them back."""
+    analysis_id = msg.get("analysis_id")
+    store.set_hidden(conn, video_ids=list(msg.get("video_ids") or []),
+                     analysis_id=root_of(conn, int(analysis_id))["id"] if analysis_id is not None else None,
+                     hidden=bool(msg.get("hidden", True)))
+    return {}
+
+
 # --- deletion --------------------------------------------------------------
 #
 # Soft deletes only (store.py explains why): files go, rows stay, and the
@@ -765,6 +824,7 @@ def cmd_settings_set(conn, msg) -> dict:
 COMMANDS = {
     "state": cmd_state,
     "delete_video": cmd_delete_video,
+    "hide": cmd_hide,
     "delete_analysis": cmd_delete_analysis,
     "settings_get": cmd_settings_get,
     "settings_set": cmd_settings_set,
@@ -774,6 +834,10 @@ COMMANDS = {
     "channel": cmd_channel,
     "transcribe_many": cmd_transcribe_many,
     "export": cmd_export,
+    "rec_start": cmd_rec_start,
+    "rec_chunk": cmd_rec_chunk,
+    "rec_stop": cmd_rec_stop,
+    "rec_discard": cmd_rec_discard,
     "thread": cmd_thread,
     "analyse": cmd_analyse,
     "follow_up": cmd_follow_up,

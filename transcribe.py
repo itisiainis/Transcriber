@@ -80,6 +80,14 @@ PLATFORMS = {
         "url": "https://rutube.ru/video/{}/",
         "format": "worst[acodec!=none]",
     },
+    # Audio the panel recorded from a player on any site (recording.py). No
+    # host of its own: its "URL" is recording:<id>, and its audio is already
+    # on disk, so metadata and download read the recording, not the web.
+    "recording": {
+        "hosts": (),
+        "url": "recording:{}",
+        "format": None,
+    },
 }
 NO_CAPTIONS = "platform has no captions"   # a caption_reason, never a quality rejection
 
@@ -95,6 +103,9 @@ def parse_url(url: str) -> tuple[str, str]:
     one join key across platforms. An unknown site raises, naming the host.
     """
     url = url.strip()
+    m = re.fullmatch(r"(?:recording:)?(r[0-9a-f]{15})", url)
+    if m:
+        return "recording", m.group(1)
     if re.fullmatch(r"[0-9a-f]{32}", url):
         return "rutube", url
     if re.fullmatch(r"[0-9A-Za-z_-]{11}", url):
@@ -116,11 +127,18 @@ def video_id(url: str) -> str:
 
 
 def video_url(vid: str, platform: str = "youtube") -> str:
+    if platform == "recording":
+        # The page it was recorded on, for an export header or a link back.
+        import recording
+        return recording.page_url(vid) or PLATFORMS[platform]["url"].format(vid)
     return PLATFORMS[platform]["url"].format(vid)
 
 
 def fetch_metadata(vid: str, platform: str = "youtube") -> dict:
     """Title, channel, duration, upload date. No media downloaded."""
+    if platform == "recording":
+        import recording
+        return recording.metadata(vid)
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     if YTDLP_PROXY:
         opts["proxy"] = YTDLP_PROXY
@@ -289,6 +307,9 @@ def try_captions(meta: dict) -> dict:
 
 def download_audio(vid: str, dest: Path, platform: str = "youtube") -> Path:
     """16 kHz mono wav, which is what whisper.cpp wants."""
+    if platform == "recording":
+        import recording     # already on disk: convert, don't download
+        return recording.to_wav(vid, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     opts = {
         "format": PLATFORMS[platform]["format"],

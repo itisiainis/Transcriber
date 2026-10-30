@@ -9,6 +9,7 @@
 
 const ui = {
   picker: null,        // { videoId, mode: "list" | "ask" } — the one expanded row
+  showHidden: false,   // "Show hidden" at the bottom of the tab
   error: null,
   threadId: null,      // the analysis screen's thread, while it is open
   thread: null,
@@ -145,7 +146,8 @@ async function seek(videoId, t) {
       return;
     } catch { /* fall through to a new tab */ }
   }
-  chrome.tabs.create({ url: videoUrl(videoId, t) });
+  const url = videoUrl(videoId, t);
+  if (url) chrome.tabs.create({ url });
 }
 
 // --- the tab ---------------------------------------------------------------
@@ -180,7 +182,11 @@ function renderAnalyse() {
   const analysed = new Set(state.threads.map((t) => t.video_id));
   const pending = new Set(state.analysisJobs.filter((j) => j.status !== "failed").map((j) => j.video_id));
   const fresh = state.rows.filter((r) => r.state === "done" && r.has_transcript
-    && !analysed.has(r.video_id) && !pending.has(r.video_id));
+    && !analysed.has(r.video_id) && !pending.has(r.video_id) && (ui.showHidden || !r.hidden));
+  const freshHidden = state.rows.filter((r) => r.state === "done" && r.has_transcript
+    && !analysed.has(r.video_id) && !pending.has(r.video_id) && r.hidden).length;
+  const threads = state.threads.filter((t) => ui.showHidden || !t.hidden);
+  const hiddenCount = freshHidden + state.threads.filter((t) => t.hidden).length;
 
   const p = ui.picker;
   if (p && !fresh.some((r) => r.video_id === p.videoId)) {
@@ -193,14 +199,23 @@ function renderAnalyse() {
     items.push(sectionHeader("fresh", "Transcribed, not analysed"));
     for (const r of fresh) {
       if (p && p.videoId === r.video_id) items.push(pickerItem(p));
-      else items.push({ key: `f-${r.video_id}`, sig: JSON.stringify([r.title, r.channel, r.duration]), build: () => buildFreshRow(r) });
+      else items.push({ key: `f-${r.video_id}`, sig: JSON.stringify([r.title, r.channel, r.duration, r.hidden]), build: () => buildFreshRow(r) });
     }
   }
-  if (state.threads.length) {
+  if (threads.length) {
     items.push(sectionHeader("done", "Done"));
-    for (const t of state.threads) {
+    for (const t of threads) {
       items.push({ key: `t-${t.id}`, sig: JSON.stringify(t) + relTime(t.updated_at), build: () => buildThreadRow(t) });
     }
+  }
+  // Hidden videos and threads (sidepanel.js "hiding"): one switch for both.
+  if (hiddenCount) {
+    const label = ui.showHidden ? "Hide hidden" : `Show hidden (${hiddenCount})`;
+    items.push({ key: "show-hidden", sig: label, build: () => {
+      const b = el("button", "text-btn show-hidden", label);
+      b.addEventListener("click", () => { ui.showHidden = !ui.showHidden; renderAnalyse(); });
+      return b;
+    } });
   }
   if (!items.length) {
     items.push({ key: "empty", sig: "", build: () => el("p", "empty", "Transcribe a video first — then analyse it here.") });
@@ -284,7 +299,10 @@ function buildThreadRow(t) {
   }
   const chev = el("span", "chev");
   chev.innerHTML = ICON.chev;
-  card.append(dot, body, chev);
+  const end = el("span", "row-end");
+  end.append(hideButton(t.hidden, () => setHidden({ analysis_id: t.id }, !t.hidden)), chev);
+  if (t.hidden) card.classList.add("is-hidden");
+  card.append(dot, body, end);
   card.addEventListener("click", () => openThread(t.id));
   card.addEventListener("keydown", (e) => { if (e.key === "Enter") openThread(t.id); });
   return card;
@@ -297,7 +315,11 @@ function buildFreshRow(r) {
     el("div", "sub", [r.channel, fmtDuration(r.duration)].filter(Boolean).join(" · ")));
   const btn = el("button", "outline", "Analyse");
   btn.addEventListener("click", () => { ui.picker = { videoId: r.video_id, mode: "list" }; renderAnalyse(); });
-  card.append(body, btn);
+  // Hides the video, so it leaves the Transcribe list too: one flag, one meaning.
+  const end = el("span", "row-end");
+  end.append(hideButton(r.hidden, () => setHidden({ video_ids: [r.video_id] }, !r.hidden)), btn);
+  if (r.hidden) card.classList.add("is-hidden");
+  card.append(body, end);
   return card;
 }
 
@@ -422,6 +444,7 @@ function onScreenClosed(id) {
     clearTimeout(ui.threadTimer);
   }
   if (id === "channel") clearTimeout(ch.timer);     // channel.js: stop asking for a listing
+  if (id === "record") stopProbe();                 // record.js: the page stops reporting
 }
 
 function question(text) {

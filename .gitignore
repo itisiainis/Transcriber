@@ -4,6 +4,7 @@ whisper/
 
 # данные и результаты работы
 audio/
+recordings/
 transcripts/
 analyses/
 *.log

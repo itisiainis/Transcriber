@@ -55,6 +55,15 @@ const SETTINGS = [
     ],
   },
   {
+    title: "Recording",
+    note: "Recording a player on any page stops by itself after this much silence while it plays.",
+    fields: [
+      { key: "record_silence_stop", label: "Silence stop (seconds)", type: "number", min: 3, max: 3600, step: 1 },
+      { key: "record_silence_stop_live", label: "Silence stop, live streams", type: "number", min: 10, max: 7200, step: 10,
+        hint: "Seconds. A live stream can go quiet for a while — a break, a slide — without being over." },
+    ],
+  },
+  {
     title: "Storage",
     fields: [
       {

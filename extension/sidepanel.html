@@ -47,6 +47,12 @@
           </button>
         </form>
         <p class="form-error" id="link-error" hidden></p>
+
+        <!-- Any other site: scan the tab for players, on request only. -->
+        <button class="wide-outline" id="record-open">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.5" class="fill"/></svg>
+          Choose what to record
+        </button>
       </div>
 
       <div class="list-area">
@@ -68,6 +74,10 @@
               <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="1.5"/><path d="M8 2.5v3M8 7v1.5"/></svg>
               <span>Separate .zip</span>
             </button>
+            <button class="tool" id="sel-hide" title="Out of the list; nothing is deleted">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 8S4 4 8 4s6.2 4 6.2 4-2.2 4-6.2 4S1.8 8 1.8 8z"/><circle cx="8" cy="8" r="1.8"/><path d="M2.5 13.5 13.5 2.5"/></svg>
+              <span>Hide</span>
+            </button>
             <button class="tool danger" id="sel-delete">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 9h5.8l.6-9"/></svg>
               <span>Delete</span>
@@ -78,6 +88,7 @@
         </div>
         <ol class="rows" id="rows"></ol>
         <p class="empty" id="empty" hidden>Nothing transcribed yet.</p>
+        <button class="text-btn show-hidden" id="show-hidden" hidden></button>
       </div>
     </section>
 
@@ -255,6 +266,35 @@
       <div class="screen-body tinted ch-body" id="ch-body"></div>
     </section>
 
+    <!-- Record: the players on this tab, found on request ------------------>
+    <section class="screen" id="record" aria-hidden="true">
+      <header class="screen-head">
+        <button class="icon-btn" id="rec-back" aria-label="Back">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+        </button>
+        <div class="screen-title">
+          <h1 id="rec-title"></h1>
+          <p class="meta"><span id="rec-meta"></span></p>
+        </div>
+        <div class="screen-actions">
+          <div class="toolbar">
+            <button class="tool" id="rec-rescan" title="Look for players on this tab again">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3"/></svg>
+              <span>Rescan</span>
+            </button>
+          </div>
+          <!-- The recording in progress, or the one that just finished. -->
+          <div class="rec-now" id="rec-now" hidden></div>
+          <button class="primary rec-go" id="rec-go" disabled>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4" class="fill"/></svg>
+            <span id="rec-go-label">Pick what to record</span>
+          </button>
+          <p class="form-error" id="rec-go-error" hidden></p>
+        </div>
+      </header>
+      <div class="screen-body tinted ch-body" id="rec-body"></div>
+    </section>
+
     <!-- Settings: one source of truth, the settings table (settings.py) ---->
     <section class="screen" id="settings" aria-hidden="true">
       <header class="screen-head simple">
@@ -273,5 +313,6 @@
   <script src="analyse.js"></script>
   <script src="settings.js"></script>
   <script src="channel.js"></script>
+  <script src="record.js"></script>
 </body>
 </html>

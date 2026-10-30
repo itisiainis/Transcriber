@@ -32,7 +32,7 @@ import store
 import transcribe as tx
 
 RULE = "═" * 52
-PLATFORM_NAMES = {"youtube": "YouTube", "rutube": "RuTube"}
+PLATFORM_NAMES = {"youtube": "YouTube", "rutube": "RuTube", "recording": "запись со страницы"}
 MISSING = "—"
 
 

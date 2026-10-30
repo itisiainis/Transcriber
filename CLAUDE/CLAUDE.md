@@ -27,6 +27,7 @@ run.py          Wires the two together: transcribe, store, optionally analyse.
 channel.py      A channel's video list (yt-dlp flat-playlist), for picking from.
 batch.py        Several transcriptions queued as ordinary jobs, with estimates.
 export.py       Transcripts out as .txt (combined) or a zip (separate).
+recording.py    Audio recorded in the panel: chunks to disk, joined, a pipeline source.
 jobs.py         Job queue + single-worker lock (own tables: jobs, worker).
 worker.py       Runs queued jobs in two lanes (transcribe / analyse), exits
                 when idle. Started by host.py, never by hand.
@@ -36,6 +37,7 @@ extension/      MV3 side panel. sidepanel.js = shell + Transcribe tab,
                 analyse.js = Analyse tab and its screens, markdown.js =
                 renderer for answers, settings.js = settings screen,
                 channel.js = a channel's videos to pick from,
+                record.js + record-probe.js = recording a player on any page,
                 background.js = notifications.
 prompts/*.md    Analysis prompts. Filename stem = the name shown when choosing;
                 optional frontmatter `description:` is the line under it.
@@ -287,6 +289,29 @@ its estimate; the batch button carries the count and total ("Transcribe 12
 videos · ~4h 20m") and recalculates per tick. Videos already in the panel show
 as transcribed, queued or running instead of a checkbox. They are queued in
 the order shown.
+
+**Hiding is not deleting.** The eye on a row (and Hide in multi-select)
+takes a video out of the Transcribe list and "Transcribed, not analysed",
+or a thread out of "Done", to save scrolling. `videos.hidden_at` /
+`analyses.hidden_at`: files and rows stay, metrics never read it, and
+submitting a hidden video again shows it again. Each list ends with "Show
+hidden (N)". Queued and running rows are never hidden.
+
+**Recording a player on any page** ("Choose what to record"). The tab is
+scanned only when that button is pressed: record-probe.js is injected into
+every frame (`<all_urls>` exists for cross-origin player iframes), never
+declared as a content script. Mode A records one element with
+`captureStream()` inside its own frame — only its sound, the tab isn't
+muted. background.js owns the recording (it outlives the panel) and relays
+10-second opus chunks to the host, which appends them to
+`recordings/<id>/seg-NNN.webm` at once; at the end ffmpeg joins the
+segments (each has its own WebM header, so never plain appending) and the
+recording is queued as platform `recording` (id `r` + 15 hex) like any
+video. Two traps already hit: the last chunk arrives *after* the captured
+track ends, so finishing must wait for the recorder's `stop` even when it
+was already stopping; and every capture taps the element until its tracks
+are stopped — a leftover tap makes the next capture of the same video
+silent. Mode B (whole tab, `tabCapture`) is not built yet.
 
 **Settings** open from the sliders button at the right end of the tab bar.
 The screen edits the `settings` table through the host; each change saves

@@ -96,6 +96,8 @@ SPEC = {
     "min_words_per_min": (_const("transcribe", "MIN_WORDS_PER_MIN"), _number(0)),
     "analysis_language": (_const("analyze", "ANALYSIS_LANGUAGE"), _optional(_text)),
     "retention_days":    (_const("store", "RETENTION_DAYS"), _number(0, integer=True)),
+    "record_silence_stop":      (_const("recording", "SILENCE_STOP"), _number(3, 3600, integer=True)),
+    "record_silence_stop_live": (_const("recording", "SILENCE_STOP_LIVE"), _number(10, 7200, integer=True)),
 }
 
 
