@@ -64,6 +64,7 @@ COLUMNS = [
     ("notified_at", "TEXT"),        # background.js has shown its notification
     ("dismissed_at", "TEXT"),       # a failed analysis the user cleared away
     ("requeued", "INTEGER"),        # batch: put back once after the worker died mid-job
+    ("provider", "TEXT NOT NULL DEFAULT 'claude'"),
 ]
 
 # Entry points of transcriptions queued as a batch: a channel pick in the
@@ -169,13 +170,22 @@ def enqueue_analysis(conn, video_id: str, *, prompt: str | None = None,
     video is not queued twice while one is pending; follow-ups always queue.
     """
     kind = "follow-up" if session_id else "analyse"
+    if session_id:
+        parent = conn.execute("SELECT provider FROM analyses WHERE session_id = ? AND video_id = ? "
+                              "ORDER BY seq DESC LIMIT 1", (session_id, video_id)).fetchone()
+        if parent is None:
+            raise ValueError("No analysis thread with that session")
+        provider = parent["provider"]
+    else:
+        import settings
+        provider = settings.get("analysis_provider")
     with immediate(conn):
         if kind == "analyse":
             existing = conn.execute(
                 "SELECT id FROM jobs WHERE video_id = ? AND kind = 'analyse' "
-                "AND prompt = ? AND COALESCE(question, '') = ? "
+                "AND prompt = ? AND COALESCE(question, '') = ? AND provider = ? "
                 "AND status IN ('queued', 'running')",
-                (video_id, prompt, question or ""),
+                (video_id, prompt, question or "", provider),
             ).fetchone()
             if existing:
                 return existing["id"]
@@ -184,10 +194,10 @@ def enqueue_analysis(conn, video_id: str, *, prompt: str | None = None,
                else "https://www.youtube.com/watch?v={}").format(video_id)
         cur = conn.execute(
             """INSERT INTO jobs (kind, video_id, url, status, created_at,
-                                 prompt, question, session_id)
-               VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)""",
+                                 prompt, question, session_id, provider)
+               VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
             (kind, video_id, url, store.now(),
-             prompt, question, session_id),
+             prompt, question, session_id, provider),
         )
         return cur.lastrowid
 

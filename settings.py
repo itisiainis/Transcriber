@@ -82,6 +82,12 @@ def _text(v):
     return v.strip()
 
 
+def _analysis_provider(v):
+    if v not in ("claude", "chatgpt"):
+        raise ValueError('must be "claude" or "chatgpt"')
+    return v
+
+
 # key -> (default, validator). The default is the constant the setting
 # replaced; change a default there, not here.
 SPEC = {
@@ -95,6 +101,7 @@ SPEC = {
     "min_density":       (_const("transcribe", "MIN_DENSITY"), _number(0, 1)),
     "min_words_per_min": (_const("transcribe", "MIN_WORDS_PER_MIN"), _number(0)),
     "analysis_language": (_const("analyze", "ANALYSIS_LANGUAGE"), _optional(_text)),
+    "analysis_provider": (_const("analyze", "ANALYSIS_PROVIDER"), _analysis_provider),
     "retention_days":    (_const("store", "RETENTION_DAYS"), _number(0, integer=True)),
     "record_silence_stop":      (_const("recording", "SILENCE_STOP"), _number(3, 3600, integer=True)),
     "record_silence_stop_live": (_const("recording", "SILENCE_STOP_LIVE"), _number(10, 7200, integer=True)),

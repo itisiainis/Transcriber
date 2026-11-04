@@ -31,7 +31,7 @@
 
   const keys = new WeakMap();     // element -> key, stable for this frame's lifetime
   const watched = new WeakSet();  // elements carrying our listeners
-  const observedRoots = new WeakSet();
+  let observedRoots = new WeakSet();
   const observers = [];
   let seq = 0;
   let running = false;
@@ -141,6 +141,7 @@
     clearInterval(poll);
     timer = poll = null;
     for (const mo of observers.splice(0)) mo.disconnect();
+    observedRoots = new WeakSet();
   }
 
   // --- recording one element (mode A) ---------------------------------------
@@ -203,6 +204,7 @@
   function attach(el) {
     const r = recording;
     const stream = el.captureStream();
+    r.capture = stream;       // also release tracks if setup throws halfway through
     // Every capture taps the element until its tracks are stopped, and a
     // tap left behind keeps the sound: the next capture of the same video —
     // a second recording, or the next segment — then gets silence. So the
@@ -221,11 +223,20 @@
     const mr = new MediaRecorder(new MediaStream(tracks),
       { mimeType: "audio/webm;codecs=opus", audioBitsPerSecond: r.bitrate });
     mr.ondataavailable = (e) => queueChunk(r, seg, e.data);
-    r.segTracks = tracks;
-    r.segDone = new Promise((ok) => { mr.onstop = ok; });     // see endSegment()
+    const segment = { mr, tracks, stream, done: null, closing: null };
+    r.segment = segment;
+    segment.done = new Promise((ok) => { mr.onstop = ok; });
     // A player that swaps its source ends the track: close this segment, and
     // the tick opens the next one on whatever then plays.
-    tracks[0].addEventListener("ended", () => endSegment());
+    for (const track of tracks) track.addEventListener("ended", () => {
+      // An old track can finish after its replacement has started.
+      if (recording === r && r.segment === segment) void endSegment(r);
+    });
+    mr.onerror = (event) => {
+      if (recording !== r || r.segment !== segment) return;
+      recState({ error: event.error?.message || "The audio recorder failed" });
+      void finishRecording("recorder error");
+    };
     mr.start(CHUNK_MS);
     if (el.paused) mr.pause();
     if (r.el && r.el !== el) detachEvents(r.el);
@@ -236,7 +247,7 @@
     // The level meter: for "is anything coming through at all" and for the
     // silence stop. An AudioContext in a frame nobody clicked stays
     // suspended and reads zeros — then the meter is off, not "silent".
-    r.ctx?.close();
+    r.ctx?.close().catch(() => {});
     r.ctx = new AudioContext();
     r.ctx.resume().catch(() => {});
     r.analyser = r.ctx.createAnalyser();
@@ -256,20 +267,21 @@
   // again). The second call must still wait for that last chunk; returning
   // early because the recorder was already stopping lost the final seconds
   // of every recording.
-  async function endSegment() {
-    const r = recording;
-    if (!r) return;
-    const tracks = r.segTracks;
-    r.segTracks = null;
-    if (r.mr) {
-      const mr = r.mr;
-      r.mr = null;
-      if (mr.state !== "inactive") mr.stop();     // flushes the last chunk
-    }
-    await r.segDone;      // "stop" fires after the last "dataavailable"
-    // Only now release the tap (see attach): stopping the track first would
-    // cut the recorder off before its last chunk.
-    for (const t of tracks || []) t.stop();
+  function endSegment(r = recording) {
+    const segment = r?.segment;
+    if (!segment) return Promise.resolve();
+    if (segment.closing) return segment.closing;
+    segment.closing = (async () => {
+      if (segment.mr.state !== "inactive") segment.mr.stop();
+      await segment.done; // includes the final dataavailable, even on a second call
+      for (const track of segment.stream.getTracks()) track.stop();
+      if (r.segment === segment) {
+        r.segment = null;
+        r.mr = null;
+        r.capture = null;
+      }
+    })();
+    return segment.closing;
   }
 
   function level() {
@@ -281,12 +293,15 @@
     return Math.sqrt(sum / r.buf.length);
   }
 
-  function tick() {
+  async function tick() {
     const r = recording;
-    if (!r || r.finishing) return;
+    if (!r || r.finishing || r.transitioning) return;
     // The player rebuilt its <video> (reconnect, quality switch): find what
     // plays now and carry on in a new segment. Recorded audio is untouched.
-    if (!r.el || !r.el.isConnected || (!r.mr && r.el)) {
+    if (!r.el || !r.el.isConnected || !r.mr || r.segment?.closing) {
+      r.transitioning = true;
+      await endSegment(r);
+      if (recording !== r || r.finishing) { r.transitioning = false; return; }
       const live = r.el?.isConnected ? r.el : null;
       const next = live || collect(document).find((m) => m.tagName === r.tag && !m.paused)
         || collect(document).find((m) => m.tagName === r.tag);
@@ -299,6 +314,7 @@
           return;
         }
       }
+      r.transitioning = false;
     }
     if (!r.mr || !r.el || r.el.paused || r.el.ended) return;
 
@@ -323,12 +339,17 @@
     recording = {
       recId: msg.recId, tag: el.tagName, seg: msg.seg || 0, bitrate: msg.bitrate,
       silenceStop: msg.silenceStop, silenceStopLive: msg.silenceStopLive,
-      queue: Promise.resolve(), segDone: Promise.resolve(), el: null, mr: null, ctx: null,
+      queue: Promise.resolve(), segment: null, capture: null, el: null, mr: null, ctx: null,
       heard: false, silentS: 0, playingS: 0, finishing: false,
     };
     try {
       attach(el);
     } catch (e) {
+      const r = recording;
+      if (r.mr?.state !== "inactive" && r.mr) r.mr.stop();
+      for (const track of r.capture?.getTracks() || []) track.stop();
+      if (r.el) detachEvents(r.el);
+      r.ctx?.close().catch(() => {});
       recording = null;
       throw new Error(/cross-origin/i.test(e.message)
         ? "Chrome blocks capturing this player (cross-origin media) — use “Whole tab”"
@@ -344,10 +365,11 @@
     if (!r || r.finishing) return;
     r.finishing = true;
     clearInterval(r.timer);
-    await endSegment();
+    await endSegment(r);
     await r.queue;                    // every chunk is on disk before "finished"
     if (r.el) detachEvents(r.el);
-    r.ctx?.close();
+    for (const track of r.capture?.getTracks() || []) track.stop();
+    await r.ctx?.close().catch(() => {});
     recording = null;
     try { await chrome.runtime.sendMessage({ type: "rec-finished", recId: r.recId, reason }); }
     catch { /* nobody to tell */ }

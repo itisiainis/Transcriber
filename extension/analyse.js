@@ -290,6 +290,7 @@ function buildThreadRow(t) {
   const body = el("div", "body");
   const meta = el("div", "meta-line");
   meta.append(el("span", "chip clay", promptLabel(t.prompt)), el("span", null, relTime(t.updated_at)));
+  meta.append(el("span", null, `· ${t.provider === "chatgpt" ? "ChatGPT" : "Claude"}`));
   if (t.followups) meta.append(el("span", null, `· ${t.followups} follow-up${t.followups === 1 ? "" : "s"}`));
   if (t.unread) meta.append(el("span", null, "· unread"));
   body.append(el("div", "title", t.title || t.video_id), el("div", "sub", t.channel || ""), meta);

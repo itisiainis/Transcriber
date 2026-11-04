@@ -150,7 +150,8 @@ function renderRecord() {
   if (rec.error) out.push(el("p", "form-error", rec.error));
   const list = el("ol", "rows");
   for (const x of sources) list.append(buildSourceRow(x));
-  if (!rec.error) list.append(buildWholeTabRow());
+  // Tab audio capture does not depend on injecting a probe into the site.
+  if (!rec.error || /^https?:/.test(rec.url)) list.append(buildWholeTabRow());
   out.push(list);
   if (!rec.error && !rec.scanning && !sources.length) {
     out.push(el("p", "hint rec-note",
@@ -222,8 +223,8 @@ function renderRecNow() {
   box.hidden = !recNow;
   const go = $("rec-go");
   const picked = selectedSource();
-  go.disabled = !!recActive() || !picked;
-  $("rec-go-label").textContent = rec.selected === "tab" ? "Whole tab — next step, not built yet"
+  go.disabled = !!recActive() || recNow?.status === "saving" || recStarting || (!picked && rec.selected !== "tab");
+  $("rec-go-label").textContent = rec.selected === "tab" ? "Record whole tab"
     : picked ? `Record ${sourceLabel(picked.s).toLowerCase()}` : "Pick what to record";
   if (!recNow) { recCardSig = null; return; }
 
@@ -257,11 +258,11 @@ function renderRecNow() {
   if (r.error) lines.push(el("div", "form-error", r.error));
   if (r.status === "saved") {
     lines.push(el("div", "hint", `${r.reason ? `Stopped: ${r.reason}. ` : ""}`
-      + "Transcribing now — it shows in the Transcribe list like any video."));
+      + "Audio saved. Use Transcribe in the list whenever you are ready."));
   }
   const actions = el("div", "rec-actions");
   if (recActive()) {
-    const stopBtn = el("button", "tool", "Stop & transcribe");
+    const stopBtn = el("button", "tool", "Stop & save");
     stopBtn.addEventListener("click", async () => {
       stopBtn.disabled = true;
       await chrome.runtime.sendMessage({ type: "rec-stop" }).catch(() => {});
@@ -280,20 +281,25 @@ function renderRecNow() {
   box.replaceChildren(...lines);
 }
 
+let recStarting = false;
 async function startRecording() {
   const p = selectedSource();
-  if (!p) return;
+  const wholeTab = rec.selected === "tab";
+  if (recStarting || (!p && !wholeTab)) return;
+  recStarting = true;
   const err = $("rec-go-error");
   err.hidden = true;
   $("rec-go").disabled = true;
   // Several videos on one page (a lesson of five) would all get the page's
   // title: number them, in page order.
-  const title = (rec.title || hostOf(rec.url)) + (p.count > 1 ? ` — video ${p.index + 1}` : "");
+  const title = (rec.title || hostOf(rec.url)) + (!wholeTab && p.count > 1 ? ` — video ${p.index + 1}` : "");
   const res = await chrome.runtime.sendMessage({
-    type: "rec-start", tabId: rec.tabId, frameId: p.frameId, key: p.s.key, title,
-    pageUrl: rec.url, source: `${sourceLabel(p.s)}${p.f.top ? "" : ` in ${hostOf(p.f.url)}`}`,
-    live: p.s.duration === "live",
+    type: "rec-start", mode: wholeTab ? "tab" : "element", tabId: rec.tabId,
+    frameId: p?.frameId, key: p?.s.key, title,
+    pageUrl: rec.url, source: wholeTab ? "Whole tab" : `${sourceLabel(p.s)}${p.f.top ? "" : ` in ${hostOf(p.f.url)}`}`,
+    live: wholeTab || p.s.duration === "live",
   }).catch((e) => ({ ok: false, error: e.message }));
+  recStarting = false;
   if (!res?.ok) {
     err.textContent = res?.error || "Couldn't start recording";
     err.hidden = false;
@@ -305,7 +311,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== "rec-update") return;
   const wasSaving = recNow?.status === "saving";
   recNow = msg.recording;
-  if (wasSaving && recNow?.status === "saved") refresh();     // the transcription job is queued
+  if (wasSaving && recNow?.status === "saved") refresh();     // show the saved audio in the list
   renderRecNow();
 });
 

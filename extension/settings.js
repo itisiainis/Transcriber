@@ -48,6 +48,12 @@ const SETTINGS = [
     title: "Analysis",
     fields: [
       {
+        key: "analysis_provider", label: "Analyze with", type: "select",
+        options: [["claude", "Claude"], ["chatgpt", "ChatGPT"]],
+        hint: "ChatGPT uses Codex signed in with your ChatGPT account; Claude uses Claude Code. "
+          + "Applies to new analyses. Follow-ups keep their thread's provider.",
+      },
+      {
         key: "analysis_language", label: "Answer in", type: "select", nullable: true,
         options: [[null, "Whatever fits the video"], ["Russian", "Russian"], ["English", "English"]],
         hint: "Adds \"Answer in …\" to every new analysis. Follow-ups keep their thread's language.",

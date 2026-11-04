@@ -38,6 +38,7 @@ extension/      MV3 side panel. sidepanel.js = shell + Transcribe tab,
                 renderer for answers, settings.js = settings screen,
                 channel.js = a channel's videos to pick from,
                 record.js + record-probe.js = recording a player on any page,
+                record-tab.html/js = offscreen whole-tab audio recorder,
                 background.js = notifications.
 prompts/*.md    Analysis prompts. Filename stem = the name shown when choosing;
                 optional frontmatter `description:` is the line under it.
@@ -164,6 +165,21 @@ analyses.
 allowed (fact-checking needs it); file and shell tools are removed via
 `--tools`, since it has no business touching this folder. The transcript is
 untrusted text — the prompt says so explicitly.
+
+**Analysis provider is a setting.** `analysis_provider` is `claude` (default)
+or `chatgpt`. Settings → Analysis → Analyze with selects it. ChatGPT runs
+through the signed-in Codex CLI (`codex exec --json`), using ChatGPT auth,
+live web search, medium reasoning and a read-only sandbox, with shell tools,
+apps, plugins, hooks and subagents disabled. It ignores user Codex config
+and project instruction documents so coding preferences do not enter an
+analysis; authentication still uses the existing login. The executable is
+found on PATH or in the VS Code Codex extension's bundled Windows binary.
+Only the final agent message is saved, never JSON events or tool activity.
+`thread.started` supplies the session ID; follow-ups use `exec resume`.
+Both `jobs.provider` and `analyses.provider` preserve the choice; old rows
+migrate to Claude. Jobs snapshot it when queued, while follow-ups always
+use their parent thread's provider, regardless of current settings.
+Tests: `.venv\Scripts\python -m unittest discover -s tests -p 'test_*.py'`.
 
 **whisper's stderr is read, not discarded.** It carries live progress
 (`--print-progress`), the language-detection probability, and the
@@ -306,12 +322,41 @@ muted. background.js owns the recording (it outlives the panel) and relays
 10-second opus chunks to the host, which appends them to
 `recordings/<id>/seg-NNN.webm` at once; at the end ffmpeg joins the
 segments (each has its own WebM header, so never plain appending) and the
-recording is queued as platform `recording` (id `r` + 15 hex) like any
-video. Two traps already hit: the last chunk arrives *after* the captured
+recording is saved as platform `recording` (id `r` + 15 hex) in the video
+list, with state `saved`. Stop & save never queues transcription or starts
+Whisper; the row's Transcribe button explicitly queues it later, using
+`recording:<id>` rather than the original site's URL. This keeps recording
+usable on battery without the cost of transcription. Two traps already hit:
+the last chunk arrives *after* the captured
 track ends, so finishing must wait for the recorder's `stop` even when it
 was already stopping; and every capture taps the element until its tracks
 are stopped — a leftover tap makes the next capture of the same video
-silent. Mode B (whole tab, `tabCapture`) is not built yet.
+silent. Segment shutdown is serialized: a replacement waits for the old
+recorder's final chunk and track cleanup, and late events from an old track
+cannot stop its replacement. Failed setup also releases its capture tracks.
+Mode B (whole tab) uses `tabCapture` with an offscreen `USER_MEDIA` document
+(Chrome 116+). It records all tab audio until Stop, Discard, the tab closes,
+or Chrome ends capture; player changes, silence, panel closure and navigation
+do not stop it. The captured stream is connected to an AudioContext destination
+so the owner still hears the tab. The toolbar icon must have been invoked on
+the target tab to grant capture access. Both modes flush before saving, and a
+new recording cannot start while the old one is starting or saving.
+
+Recording regression checks: `node --test tests/recording.test.cjs` (Node.js,
+no npm packages). These exercise lifecycle and messaging with browser mocks;
+actual site audio and Chrome capture permissions still need browser checks.
+
+**Recordings can be transferred as plain audio.** Download audio on a saved,
+failed or transcribed recording exports its original `audio.webm` without
+re-encoding. Import recording (.webm) in the intake uploads that file into a
+new recording ID, validates that ffprobe finds audio, and registers it as
+`saved`. Neither import nor export queues transcription. The title comes
+from the filename; original page metadata and analysis history are not in
+the audio export. `rec_export` reads one 384,000-byte chunk per request;
+`rec_import_start/chunk/finish` write to `import.webm` with checked offsets
+and a declared byte count, then publish `audio.webm` only after validation.
+Aborting cannot remove a completed import if its success reply was lost.
+The receiving device uses its own installed Whisper backend and settings.
 
 **Settings** open from the sliders button at the right end of the tab bar.
 The screen edits the `settings` table through the host; each change saves

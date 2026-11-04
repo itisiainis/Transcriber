@@ -83,6 +83,69 @@ def audio_path(rec_id: str) -> Path:
     return folder(rec_id) / "audio.webm"
 
 
+TRANSFER_CHUNK = 384_000  # raw bytes; base64 stays below native messaging limits
+
+
+def export_chunk(rec_id: str, offset: int) -> dict:
+    path = audio_path(rec_id)
+    total = path.stat().st_size
+    if offset < 0 or offset > total:
+        raise ValueError("invalid audio offset")
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        data = stream.read(TRANSFER_CHUNK)
+    title = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", meta(rec_id).get("title") or rec_id).strip()
+    return {"filename": f"{title[:120] or rec_id}.webm", "total": total, "data": data}
+
+
+def begin_import(filename: str, size: int) -> str:
+    name = re.split(r"[\\/]", filename or "")[-1]
+    if not name.lower().endswith(".webm"):
+        raise ValueError("Choose a .webm recording exported from Transcriber")
+    if size <= 0:
+        raise ValueError("The recording is empty")
+    rec_id = start(name[:-5], None, "Imported recording", False)
+    m = meta(rec_id)
+    m.update({"import_size": size, "import_filename": name})
+    _save_meta(rec_id, m)
+    (folder(rec_id) / "import.webm").touch()
+    return rec_id
+
+
+def import_chunk(rec_id: str, offset: int, data: bytes) -> int:
+    m = meta(rec_id)
+    path = folder(rec_id) / "import.webm"
+    if m.get("finished_at") or not path.is_file():
+        raise ValueError("No pending import")
+    current = path.stat().st_size
+    if offset != current or not data or len(data) > TRANSFER_CHUNK:
+        raise ValueError("Invalid recording chunk or offset; import the file again")
+    if current + len(data) > m["import_size"]:
+        raise ValueError("Recording exceeds the declared file size")
+    with path.open("ab") as stream:
+        stream.write(data)
+    return current + len(data)
+
+
+def finish_import(rec_id: str) -> dict:
+    m = meta(rec_id)
+    path = folder(rec_id) / "import.webm"
+    if m.get("finished_at") or not path.is_file() or path.stat().st_size != m.get("import_size"):
+        raise ValueError("Recording import is incomplete")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=codec_type", "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if probe.returncode or not json.loads(probe.stdout).get("streams"):
+        raise ValueError("This file does not contain readable recording audio")
+    path.replace(audio_path(rec_id))
+    m.update({"finished_at": store.now(), "reason": "imported", "segments": 1,
+              "duration": duration(audio_path(rec_id)), "bytes": m["import_size"]})
+    _save_meta(rec_id, m)
+    return m
+
+
 def duration(path: Path) -> float | None:
     try:
         p = subprocess.run(

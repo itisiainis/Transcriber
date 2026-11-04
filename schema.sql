@@ -63,8 +63,9 @@ CREATE TABLE IF NOT EXISTS analyses (
     prompt_template TEXT,                    -- 'factcheck' | 'custom' | 'follow-up' | …
     analysis_path   TEXT,                    -- analyses/<video_id>/<NNN>-<name>.md
     seq             INTEGER,                 -- position in this video's thread, from 1
-    duration_s      REAL,                    -- how long Claude took to answer
-    session_id      TEXT,                    -- the Claude Code session, resumable
+    duration_s      REAL,                    -- how long the provider took to answer
+    session_id      TEXT,                    -- the provider's resumable session
+    provider        TEXT NOT NULL DEFAULT 'claude',
     parent_id       INTEGER REFERENCES analyses(id),  -- NULL = started the thread
     question        TEXT,                    -- what was asked, for --ask and follow-ups
     opened_at       TEXT,                    -- NULL until actually read; the filter-vs-hoard signal

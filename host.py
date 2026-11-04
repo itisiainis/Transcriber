@@ -213,6 +213,8 @@ def build_rows(conn) -> list[dict]:
         vid = v["video_id"]
         has_transcript = (store.TRANSCRIPT_DIR / f"{vid}.json").exists()
         state = v["status"] or ("done" if has_transcript else None)
+        if state is None and v["platform"] == "recording" and recording.audio_path(vid).is_file():
+            state = "saved"
         if state is None:
             continue
         last_job = jobs.last_for(conn, vid) if state == "failed" else None
@@ -227,6 +229,7 @@ def build_rows(conn) -> list[dict]:
             "source": source_label(v["source"]),
             "analysed": v["n_analyses"] > 0,
             "has_transcript": has_transcript,
+            "has_audio": v["platform"] == "recording" and recording.audio_path(vid).is_file(),
             "entry_point": v["entry_point"],
             # In-progress rows keep their place: a video is ordered by when it
             # first entered the list, not by when its latest run finished.
@@ -286,12 +289,14 @@ def cmd_state(conn, msg) -> dict:
 
 def cmd_transcribe(conn, msg) -> dict:
     url = (msg.get("url") or "").strip()
-    entry = msg.get("entry") if msg.get("entry") in ("page", "link") else "link"
+    entry = msg.get("entry") if msg.get("entry") in ("page", "link", "record") else "link"
     try:
         platform, vid = tx.parse_url(url)
     except ValueError as e:
         return {"ok": False, "error": f"Can't transcribe this link: {e.args[0]}"}
-    job_id = jobs.enqueue(conn, vid, tx.video_url(vid, platform), entry)
+    # A recording's public URL is its original page, not its pipeline source.
+    source_url = f"recording:{vid}" if platform == "recording" else tx.video_url(vid, platform)
+    job_id = jobs.enqueue(conn, vid, source_url, "record" if platform == "recording" else entry)
     ensure_worker(conn)
     return {"video_id": vid, "job_id": job_id}
 
@@ -427,18 +432,13 @@ def cmd_rec_chunk(conn, msg) -> dict:
 
 
 def cmd_rec_stop(conn, msg) -> dict:
-    """Joins the segments and queues the transcription, like any video."""
+    """Save the audio for later. Transcription requires a separate user action."""
     rec_id = msg.get("rec_id") or ""
     m = recording.finish(rec_id, msg.get("reason"))
     log.info("recording %s finished (%s): %ss", rec_id, m.get("reason"), m.get("duration"))
     out = {"duration": m.get("duration"), "bytes": m.get("bytes"),
            "path": str(recording.audio_path(rec_id)).replace("\\", "/")}
-    if msg.get("transcribe", True):
-        out["job_id"] = jobs.enqueue(
-            conn, rec_id, f"recording:{rec_id}", "record",
-            {"title": m.get("title"), "channel": m.get("site"),
-             "duration": int(m["duration"]) if m.get("duration") else None})
-        ensure_worker(conn)
+    store.upsert_video(conn, recording.metadata(rec_id))
     return out
 
 
@@ -447,6 +447,41 @@ def cmd_rec_discard(conn, msg) -> dict:
     rec_id = msg.get("rec_id") or ""
     recording.remove(rec_id)
     log.info("recording %s discarded", rec_id)
+    return {}
+
+
+def cmd_rec_export(conn, msg) -> dict:
+    rec_id = msg.get("rec_id") or ""
+    row = conn.execute("SELECT video_id FROM videos WHERE video_id = ? AND deleted_at IS NULL",
+                       (rec_id,)).fetchone()
+    if row is None:
+        raise ValueError("No saved recording")
+    result = recording.export_chunk(rec_id, int(msg.get("offset", 0)))
+    result["data"] = base64.b64encode(result["data"]).decode("ascii")
+    return result
+
+
+def cmd_rec_import_start(conn, msg) -> dict:
+    return {"rec_id": recording.begin_import(msg.get("filename"), int(msg.get("size", 0)))}
+
+
+def cmd_rec_import_chunk(conn, msg) -> dict:
+    data = base64.b64decode(msg.get("data") or "", validate=True)
+    return {"bytes": recording.import_chunk(msg.get("rec_id") or "", int(msg.get("offset", 0)), data)}
+
+
+def cmd_rec_import_finish(conn, msg) -> dict:
+    rec_id = msg.get("rec_id") or ""
+    recording.finish_import(rec_id)
+    store.upsert_video(conn, recording.metadata(rec_id))
+    return {"video_id": rec_id}
+
+
+def cmd_rec_import_abort(conn, msg) -> dict:
+    rec_id = msg.get("rec_id") or ""
+    # A lost success reply must not delete an already completed import.
+    if not recording.meta(rec_id).get("finished_at"):
+        recording.remove(rec_id)
     return {}
 
 
@@ -483,6 +518,7 @@ def build_threads(conn) -> list[dict]:
                 "duration_s": r["duration_s"], "verdict": r["verdict"],
                 "unread": r["opened_at"] is None, "followups": 0,
                 "resumable": bool(r["session_id"]),
+                "provider": r["provider"],
                 "hidden": r["hidden_at"] is not None,
             }
             threads[r["id"]] = t
@@ -617,6 +653,7 @@ def cmd_thread(conn, msg) -> dict:
         "title": video["title"], "channel": video["channel"], "duration": video["duration"],
         "prompt": root["prompt_template"], "verdict": root["verdict"],
         "resumable": bool(root["session_id"]),
+        "provider": root["provider"],
         "entries": entries, "pending": pending,
     }
 
@@ -838,6 +875,11 @@ COMMANDS = {
     "rec_chunk": cmd_rec_chunk,
     "rec_stop": cmd_rec_stop,
     "rec_discard": cmd_rec_discard,
+    "rec_export": cmd_rec_export,
+    "rec_import_start": cmd_rec_import_start,
+    "rec_import_chunk": cmd_rec_import_chunk,
+    "rec_import_finish": cmd_rec_import_finish,
+    "rec_import_abort": cmd_rec_import_abort,
     "thread": cmd_thread,
     "analyse": cmd_analyse,
     "follow_up": cmd_follow_up,

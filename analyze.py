@@ -1,11 +1,11 @@
 """
-analyze.py — run a transcript past Claude Code and keep the answer.
+analyze.py — run a transcript past Claude Code or ChatGPT (Codex) and keep the answer.
 
-Uses the `claude` CLI in print mode, so it runs on your subscription rather
-than a per-token API key. Web search is allowed (fact-checking needs it);
-file editing and shell are not, since it has no business touching this folder.
+Uses the selected provider's CLI (`claude` or `codex`), signed in with a
+subscription rather than a per-token API key. Web search is allowed for
+fact-checking; local command execution and file editing are restricted.
 
-Every analysis opens a named Claude Code session and stores its id, so a
+Every analysis opens a provider session and stores its id, so a
 follow-up resumes that session instead of re-sending the transcript. The
 answer already in context is what the follow-up is about.
 
@@ -17,6 +17,7 @@ answer already in context is what the follow-up is about.
 """
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ import store
 from transcribe import video_id as parse_video_id
 
 CLAUDE_EXE = "claude"
+ANALYSIS_PROVIDER = "claude"  # [setting] analysis_provider
 PROMPT_DIR = Path("prompts")
 
 # Built-in tools the run may use. Everything else is unavailable, so it
@@ -81,7 +83,7 @@ def read_prompt(path: Path) -> dict:
         Fact-check this video. ...
 
     The name is the filename stem and nothing else, so the two can't disagree.
-    Only the body is ever sent to Claude.
+    Only the body is ever sent for analysis.
     """
     text = path.read_text(encoding="utf-8")
     meta: dict[str, str] = {}
@@ -134,6 +136,10 @@ def _run(args: list[str], stdin_text: str | None = None) -> str:
     cmd = [claude_path(), *args, "--tools", TOOLS, *EXTRA_FLAGS,
            # variadic, so it goes last
            "--allowedTools", "WebSearch", "WebFetch"]
+    return _communicate(cmd, stdin_text)
+
+
+def _communicate(cmd: list[str], stdin_text: str | None = None) -> str:
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8",
@@ -143,12 +149,73 @@ def _run(args: list[str], stdin_text: str | None = None) -> str:
     try:
         out, err = proc.communicate(stdin_text, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            proc.kill()
         proc.communicate()
         raise
     if proc.returncode != 0:
-        raise RuntimeError(err.strip() or f"claude exited {proc.returncode}")
+        raise RuntimeError(err.strip() or out.strip() or f"Analysis process exited {proc.returncode}")
     return out.strip()
+
+
+def codex_path() -> str:
+    for candidate in ("codex.exe", "codex.cmd", "codex.bat", "codex"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    # Chrome's PATH may not contain the executable bundled with the IDE.
+    extensions = Path.home() / ".vscode" / "extensions"
+    bundled = sorted(extensions.glob("openai.chatgpt-*/bin/*/codex.exe"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    if bundled:
+        return str(bundled[0])
+    raise RuntimeError("Codex not found. Install Codex CLI or the Codex VS Code extension, "
+                       "then sign in with your ChatGPT account (`codex login`).")
+
+
+def run_chatgpt(payload: str, session_id: str | None = None) -> tuple[str, str]:
+    """Use the signed-in Codex CLI, retaining its thread ID for follow-ups.
+
+    JSONL contains tool activity as well as the answer; only agent messages
+    belong in the saved analysis. Stdin avoids Windows' command-length limit.
+    """
+    cmd = [codex_path(), "exec", "--ignore-user-config", "--skip-git-repo-check", "--json",
+           "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
+           "-c", 'forced_login_method="chatgpt"', "-c", 'web_search="live"',
+           "-c", 'model_reasoning_effort="medium"', "-c", "project_doc_max_bytes=0"]
+    for feature in ("shell_tool", "apps", "plugins", "multi_agent", "hooks", "view_image"):
+        cmd.extend(["-c", f"features.{feature}=false"])
+    if session_id:
+        cmd.extend(["resume", session_id])
+    cmd.append("-")
+    output = _communicate(cmd, payload)
+    thread_id = session_id
+    messages = []
+    completed = False
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+        elif event.get("type") in ("turn.failed", "error"):
+            error = event.get("error") or event.get("message") or "ChatGPT analysis failed"
+            raise RuntimeError(error.get("message", str(error)) if isinstance(error, dict) else str(error))
+        elif event.get("type") == "turn.completed":
+            completed = True
+        elif event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message" and item.get("text"):
+                messages.append(item["text"])
+    if not completed or not messages or not thread_id:
+        raise RuntimeError("Codex did not return a completed answer and session ID. "
+                           "Check `codex login status` and your ChatGPT usage limits.")
+    return messages[-1].strip(), thread_id
 
 
 def run_claude(prompt: str, transcript_text: str, session_id: str) -> str:
@@ -184,17 +251,25 @@ def resume_claude(session_id: str, question: str) -> str:
     return _run(["-p", question, "--resume", session_id])
 
 
-def analyze(video_id: str, prompt: str, template_name: str) -> tuple[int, str]:
+def analyze(video_id: str, prompt: str, template_name: str,
+            provider: str | None = None) -> tuple[int, str]:
     """Start a thread: first analysis of this transcript."""
     transcript = store.get_transcript(video_id)
     if transcript is None:
         raise FileNotFoundError(f"no transcript for {video_id} — run it first")
 
     store.init()
-    session_id = str(uuid.uuid4())
+    provider = provider or settings.get("analysis_provider")
 
     t0 = time.perf_counter()
-    text = run_claude(prompt, build_input(transcript), session_id)
+    if provider == "chatgpt":
+        payload = f"{POINTER}\n\n{GUARD}\n\n{with_language(prompt)}\n\n{build_input(transcript)}"
+        text, session_id = run_chatgpt(payload)
+    elif provider == "claude":
+        session_id = str(uuid.uuid4())
+        text = run_claude(prompt, build_input(transcript), session_id)
+    else:
+        raise ValueError(f"Unknown analysis provider: {provider}")
     elapsed = round(time.perf_counter() - t0, 1)
 
     with store.connect() as conn:
@@ -202,6 +277,7 @@ def analyze(video_id: str, prompt: str, template_name: str) -> tuple[int, str]:
             conn, video_id, text, template_name,
             duration_s=elapsed, session_id=session_id,
             question=prompt if template_name == "custom" else None,
+            provider=provider,
         )
     print(f"# took {elapsed}s -> {path}", file=sys.stderr)
     return analysis_id, text
@@ -224,7 +300,7 @@ def follow_up(video_id: str, question: str, session_id: str | None = None) -> tu
             ).fetchone()
         else:
             parent = store.latest_analysis(conn, video_id)
-    if parent is None:
+    if parent is None or not parent["session_id"]:
         raise SystemExit(
             f"no resumable analysis for {video_id}. Analyses made before "
             "follow-ups existed have no session to resume — run a fresh "
@@ -232,7 +308,11 @@ def follow_up(video_id: str, question: str, session_id: str | None = None) -> tu
         )
 
     t0 = time.perf_counter()
-    text = resume_claude(parent["session_id"], question)
+    provider = parent["provider"]
+    if provider == "chatgpt":
+        text, _ = run_chatgpt(question, parent["session_id"])
+    else:
+        text = resume_claude(parent["session_id"], question)
     elapsed = round(time.perf_counter() - t0, 1)
 
     with store.connect() as conn:
@@ -240,6 +320,7 @@ def follow_up(video_id: str, question: str, session_id: str | None = None) -> tu
             conn, video_id, text, "follow-up",
             duration_s=elapsed, session_id=parent["session_id"],
             parent_id=parent["id"], question=question,
+            provider=provider,
         )
     print(f"# took {elapsed}s -> {path}", file=sys.stderr)
     return analysis_id, text

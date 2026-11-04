@@ -104,6 +104,7 @@ let recPort = null;
 let recSeq = 0;
 const recPending = new Map();
 let badgeTimer = null;
+let recStarting = false;
 
 function hostCall(cmd, args = {}) {
   if (!recPort) {
@@ -133,6 +134,25 @@ function closeHost() {
 }
 
 const active = () => rec && (rec.status === "starting" || rec.status === "recording");
+const busy = () => recStarting || active() || rec?.status === "saving";
+
+async function recorderMessage(r, msg) {
+  return r.mode === "tab"
+    ? chrome.runtime.sendMessage({ ...msg, target: "tab-recorder" })
+    : chrome.tabs.sendMessage(r.tabId, msg, { frameId: r.frameId });
+}
+
+async function openTabRecorder() {
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
+  if (!contexts.length) await chrome.offscreen.createDocument({
+    url: "record-tab.html", reasons: ["USER_MEDIA"],
+    justification: "Record tab audio and keep it audible while the panel is closed",
+  });
+}
+
+async function closeTabRecorder(r) {
+  if (r?.mode === "tab") await chrome.offscreen.closeDocument().catch(() => {});
+}
 
 function publish(patch = {}) {
   if (rec) Object.assign(rec, patch);
@@ -161,11 +181,29 @@ function badge() {
 }
 
 async function recStart(msg) {
-  if (active()) throw new Error("Already recording — stop that one first");
-  const r = await hostCall("rec_start", {
-    title: msg.title, page_url: msg.pageUrl, source: msg.source, live: !!msg.live,
-  });
+  if (busy()) throw new Error("A recording is starting, recording or saving — wait for it to finish");
+  recStarting = true;
+  try {
+    await startRecorder(msg);
+  } finally {
+    recStarting = false;
+  }
+}
+
+async function startRecorder(msg) {
+  if (msg.mode === "tab") await openTabRecorder();
+  let r;
+  try {
+    r = await hostCall("rec_start", {
+      title: msg.title, page_url: msg.pageUrl, source: msg.source, live: !!msg.live,
+    });
+  } catch (error) {
+    await closeTabRecorder(msg);
+    closeHost();
+    throw error;
+  }
   rec = {
+    mode: msg.mode || "element",
     recId: r.rec_id, tabId: msg.tabId, frameId: msg.frameId, title: msg.title,
     source: msg.source, pageUrl: msg.pageUrl, live: !!msg.live, startedAt: Date.now(),
     status: "starting", bytes: 0, playing: true, warning: null, note: null, error: null,
@@ -173,21 +211,28 @@ async function recStart(msg) {
   publish();
   let res;
   try {
-    res = await chrome.tabs.sendMessage(msg.tabId, {
+    // Request the one-use ID only when the offscreen document and host are ready.
+    const streamId = rec.mode === "tab"
+      ? await chrome.tabCapture.getMediaStreamId({ targetTabId: msg.tabId }) : undefined;
+    res = await recorderMessage(rec, {
       type: "rec-begin", recId: r.rec_id, key: msg.key, seg: 0, bitrate: r.bitrate,
+      streamId,
       silenceStop: r.silence_stop, silenceStopLive: r.silence_stop_live,
-    }, { frameId: msg.frameId });
+    });
   } catch (e) {
-    res = { ok: false, error: "The page didn't answer — rescan and try again" };
+    res = { ok: false, error: rec.mode === "tab"
+      ? `${e.message} — click the Transcriber toolbar icon on the target tab, then try again`
+      : "The page didn't answer — rescan and try again" };
   }
   if (!res?.ok) {
+    await closeTabRecorder(rec);
     rec = null;
     publish();
     await hostCall("rec_discard", { rec_id: r.rec_id }).catch(() => {});   // nothing was recorded
     closeHost();
     throw new Error(res?.error || "Couldn't start recording");
   }
-  publish({ status: "recording" });
+  if (rec?.recId === r.rec_id && rec.status === "starting") publish({ status: "recording" });
 }
 
 async function recChunk(msg) {
@@ -198,12 +243,12 @@ async function recChunk(msg) {
 
 async function recStop(reason) {
   if (!active()) return;
+  const current = rec;
   try {
-    const res = await chrome.tabs.sendMessage(rec.tabId, { type: "rec-end", recId: rec.recId, reason },
-      { frameId: rec.frameId });
+    const res = await recorderMessage(current, { type: "rec-end", recId: current.recId, reason });
     if (res?.ok) return;     // the page flushes its last chunk, then sends rec-finished
   } catch { /* page or tab gone: close it from here */ }
-  await recFinish(rec.recId, reason);
+  await recFinish(current.recId, reason);
 }
 
 // Discard: the page stops as for Stop, and once its last chunk is in, the
@@ -215,7 +260,10 @@ async function recDiscard() {
 }
 
 async function recFinish(recId, reason) {
-  if (!rec || rec.recId !== recId || rec.status === "saving" || rec.status === "saved") return;
+  if (!rec || rec.recId !== recId || !active()) return;
+  const current = rec;
+  publish({ status: "saving", reason });
+  await closeTabRecorder(current);
   if (rec.discard) {
     try { await hostCall("rec_discard", { rec_id: recId }); } catch { /* folder stays; harmless */ }
     rec = null;
@@ -223,9 +271,8 @@ async function recFinish(recId, reason) {
     closeHost();
     return;
   }
-  publish({ status: "saving", reason });
   try {
-    const r = await hostCall("rec_stop", { rec_id: recId, reason });
+    const r = await hostCall("rec_stop", { rec_id: recId, reason, transcribe: false });
     publish({ status: "saved", duration: r.duration, bytes: r.bytes, path: r.path, jobId: r.job_id });
   } catch (e) {
     publish({ status: "failed", error: e.message });
@@ -238,7 +285,10 @@ const REC_HANDLERS = {
   "rec-stop": () => recStop("stopped"),
   "rec-discard": () => recDiscard(),
   "rec-chunk": (msg) => recChunk(msg),
-  "rec-finished": (msg) => recFinish(msg.recId, msg.reason),
+  "rec-finished": (msg) => {
+    if (msg.error && rec?.recId === msg.recId) publish({ error: msg.error });
+    return recFinish(msg.recId, msg.reason);
+  },
   "rec-state": async (msg) => {
     if (!rec || msg.recId !== rec.recId) return;
     const patch = {};
@@ -246,13 +296,14 @@ const REC_HANDLERS = {
     publish(patch);
   },
   "rec-status": async () => ({ recording: rec }),
-  "rec-dismiss": async () => { if (!active()) { rec = null; publish(); } },
+  "rec-dismiss": async () => { if (!busy()) { rec = null; publish(); } },
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.target === "tab-recorder") return;
   const handler = REC_HANDLERS[msg?.type];
   if (!handler) return;
-  handler(msg).then(
+  recReady.then(() => handler(msg)).then(
     (out) => sendResponse({ ok: true, ...(out || {}) }),
     (e) => sendResponse({ ok: false, error: e.message }),
   );
@@ -262,12 +313,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // The tab went away or loaded another page: the page-side recorder is gone
 // with it. Everything sent so far is on disk — close the recording on that.
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (active() && rec.tabId === tabId) recFinish(rec.recId, "the tab was closed");
+  if (active() && rec.tabId === tabId) recStop("the tab was closed");
 });
 // "loading" also fires for a single-page app changing its URL (soholms is
 // one), where the recorder lives on — so ask it before closing anything.
 chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (!active() || rec.tabId !== tabId || change.status !== "loading") return;
+  if (!active() || rec.mode === "tab" || rec.tabId !== tabId || change.status !== "loading") return;
   const { recId, frameId } = rec;
   setTimeout(async () => {
     if (!active() || rec.recId !== recId) return;
@@ -281,6 +332,6 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 
 // A service worker restarted mid-recording has lost its variables, not the
 // recording: take it back from session storage.
-chrome.storage.session.get("recording").then(({ recording }) => {
+const recReady = chrome.storage.session.get("recording").then(({ recording }) => {
   if (recording && !rec) { rec = recording; badge(); }
 });

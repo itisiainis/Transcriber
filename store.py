@@ -65,6 +65,7 @@ def migrate(conn) -> None:
         # The Claude Code session this answer came from. A follow-up resumes
         # it instead of re-sending the transcript.
         ("analyses", "session_id", "TEXT"),
+        ("analyses", "provider", "TEXT NOT NULL DEFAULT 'claude'"),
         # Which analysis this one continues. NULL = it started the thread.
         ("analyses", "parent_id", "INTEGER"),
         # The question asked, for a follow-up or an --ask run.
@@ -236,7 +237,8 @@ def next_seq(conn, video_id: str) -> int:
 
 def save_analysis(conn, video_id: str, text: str, prompt_template: str,
                   duration_s: float | None = None, session_id: str | None = None,
-                  parent_id: int | None = None, question: str | None = None) -> tuple[int, Path]:
+                  parent_id: int | None = None, question: str | None = None,
+                  provider: str = "claude") -> tuple[int, Path]:
     """
     Writes analyses/<video_id>/<NNN>-<name>.md and records the row.
     Returns (analysis_id, path).
@@ -252,10 +254,10 @@ def save_analysis(conn, video_id: str, text: str, prompt_template: str,
 
     cur = conn.execute(
         """INSERT INTO analyses (video_id, created_at, prompt_template, analysis_path,
-                                 duration_s, session_id, parent_id, question, seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                 duration_s, session_id, parent_id, question, seq, provider)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (video_id, now(), prompt_template, str(path), duration_s,
-         session_id, parent_id, question, seq),
+         session_id, parent_id, question, seq, provider),
     )
     return cur.lastrowid, path
 

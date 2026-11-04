@@ -131,7 +131,7 @@ def watch_for_cancel(job_id: int, proc_box: dict, done: threading.Event) -> None
     with closing(jobs.connect()) as conn:
         while not done.wait(CANCEL_POLL):
             if jobs.cancel_requested(conn, job_id) and proc_box.get("proc"):
-                log.info("job %s: cancel requested, stopping claude", job_id)
+                log.info("job %s: cancel requested, stopping analysis", job_id)
                 proc_box["cancelled"] = True
                 kill_tree(proc_box["proc"])
                 return
@@ -141,7 +141,7 @@ def run_analyse(job) -> None:
     import analyze
 
     with closing(jobs.connect()) as conn:
-        jobs.set_stage(conn, job["id"], "claude")
+        jobs.set_stage(conn, job["id"], job["provider"])
 
     proc_box: dict = {}
     done = threading.Event()
@@ -153,13 +153,13 @@ def run_analyse(job) -> None:
             analysis_id, _ = analyze.follow_up(job["video_id"], job["question"],
                                                session_id=job["session_id"])
         elif job["prompt"] == "custom":
-            analysis_id, _ = analyze.analyze(job["video_id"], job["question"], "custom")
+            analysis_id, _ = analyze.analyze(job["video_id"], job["question"], "custom", provider=job["provider"])
         else:
             path = analyze.list_prompts().get(job["prompt"])
             if path is None:
                 raise FileNotFoundError(f"no prompt '{job['prompt']}' in prompts/")
             body = analyze.read_prompt(path)["body"]
-            analysis_id, _ = analyze.analyze(job["video_id"], body, job["prompt"])
+            analysis_id, _ = analyze.analyze(job["video_id"], body, job["prompt"], provider=job["provider"])
     except (Exception, SystemExit) as e:     # follow_up exits when there's no session
         with closing(jobs.connect()) as conn:
             if proc_box.get("cancelled"):

@@ -453,6 +453,74 @@ function saveFile(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
+
+function recordingTransferStatus(message) {
+  $("record-transfer-status").textContent = message;
+  $("record-transfer-status").hidden = !message;
+}
+
+async function downloadRecording(videoId, button) {
+  button.disabled = true;
+  const chunks = [];
+  let offset = 0, filename;
+  try {
+    while (true) {
+      const result = await host.call("rec_export", { rec_id: videoId, offset });
+      const binary = atob(result.data);
+      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+      if (!bytes.length && offset < result.total) throw new Error("The audio download was interrupted");
+      chunks.push(bytes);
+      offset += bytes.length;
+      filename = result.filename;
+      recordingTransferStatus(`Downloading recording · ${Math.round(offset / result.total * 100)}%`);
+      if (offset >= result.total) break;
+    }
+    saveFile(new Blob(chunks, { type: "audio/webm" }), filename);
+    recordingTransferStatus("Recording downloaded. Import the .webm file in Transcriber on the other device.");
+  } catch (error) {
+    recordingTransferStatus(`Download failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function importRecording(file) {
+  const button = $("record-import");
+  button.disabled = true;
+  let recId;
+  try {
+    recordingTransferStatus("Importing recording…");
+    const started = await host.call("rec_import_start", { filename: file.name, size: file.size });
+    recId = started.rec_id;
+    // Keep each request well below Chrome's native messaging limits. Read
+    // slices rather than loading a multi-hour recording into memory at once.
+    for (let offset = 0; offset < file.size; offset += 384000) {
+      const bytes = new Uint8Array(await file.slice(offset, offset + 384000).arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      await host.call("rec_import_chunk", { rec_id: recId, offset, data: btoa(binary) });
+      recordingTransferStatus(`Importing recording · ${Math.round((offset + bytes.length) / file.size * 100)}%`);
+    }
+    await host.call("rec_import_finish", { rec_id: recId });
+    recordingTransferStatus("Recording imported. Press Transcribe in the list when you are ready.");
+    refresh();
+  } catch (error) {
+    if (recId) await host.call("rec_import_abort", { rec_id: recId }).catch(() => {});
+    recordingTransferStatus(`Import failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+    $("record-import-file").value = "";
+  }
+}
+
+$("record-import").addEventListener("click", () => $("record-import-file").click());
+$("record-import-file").addEventListener("change", () => {
+  const file = $("record-import-file").files[0];
+  if (file) importRecording(file);
+});
+
 // export.py builds the file; it arrives as base64 in parts (1 MB message cap).
 async function exportSelected(mode, btn) {
   const ids = selectedExportable().map((r) => r.video_id);
@@ -546,6 +614,14 @@ function buildRow(r) {
     sub.textContent = [r.queue_position > 1 ? `queued · ${r.queue_position} in line` : "queued · next up",
       fmtEstimate(r.estimate)].filter(Boolean).join(" · ");
     li.append(el("span"));
+  } else if (r.state === "saved") {
+    glyph.classList.add("plain");
+    sub.textContent = [r.channel, fmtDuration(r.duration), "Audio saved · not transcribed"].filter(Boolean).join(" · ");
+    const btn = el("button", "retry", "Transcribe");
+    btn.addEventListener("click", (e) => { e.stopPropagation(); btn.disabled = true; retry(r.video_id); });
+    const actions = el("div", "actions");
+    actions.append(btn, recordingDownloadButton(r.video_id));
+    li.append(actions);
   } else if (r.state === "failed") {
     glyph.classList.add("bad");
     glyph.innerHTML = ICON.alert;
@@ -558,6 +634,7 @@ function buildRow(r) {
     confirmTwice(remove, "Sure?", () => deleteVideo(r.video_id));
     const actions = el("div", "actions");
     actions.append(btn, remove);
+    if (r.has_audio) actions.append(recordingDownloadButton(r.video_id));
     li.append(actions);
   } else {
     // Orange check = an analysis exists; a dashed ring = not analysed yet.
@@ -567,6 +644,7 @@ function buildRow(r) {
     if (r.hidden) li.classList.add("is-hidden");
     const end = el("span", "row-end");      // one grid cell: the eye, then the chevron
     end.append(hideButton(r.hidden, () => setHidden({ video_ids: [r.video_id] }, !r.hidden)));
+    if (r.has_audio) end.append(recordingDownloadButton(r.video_id));
     const chev = el("span", "chev");
     if (r.has_transcript) {
       chev.innerHTML = ICON.chev;
@@ -579,6 +657,15 @@ function buildRow(r) {
     li.append(end);
   }
   return li;
+}
+
+function recordingDownloadButton(videoId) {
+  const button = el("button", "retry quiet", "Download audio");
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    downloadRecording(videoId, button);
+  });
+  return button;
 }
 
 // Rows are rebuilt only when their data changes, so spinners don't restart
