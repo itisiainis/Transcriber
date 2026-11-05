@@ -17,7 +17,7 @@ died is queued again on the next start (once — see worker.recover_orphans).
 """
 
 import argparse
-import statistics
+import estimates
 import sys
 import threading
 import time
@@ -26,27 +26,10 @@ from contextlib import closing
 import jobs
 import store
 
-FALLBACK_FACTOR = 0.25      # whisper on this CPU (CLAUDE.md), until there is history
-
-
 def factors(conn) -> dict:
-    """
-    Median realtime_factor (total time / video length) from completed
-    submissions — self-calibrating as the db fills. Two of them: a non-YouTube
-    video always goes through whisper, so it is measured against whisper runs
-    only; a YouTube one against every run, captions included, because that
-    is the mix a YouTube video actually gets.
-    """
-    rows = conn.execute(
-        "SELECT realtime_factor AS f, source FROM submissions "
-        "WHERE status = 'done' AND realtime_factor > 0"
-    ).fetchall()
-    every = [r["f"] for r in rows]
-    whisper = [r["f"] for r in rows if (r["source"] or "").startswith("whisper")]
-    return {
-        "whisper": statistics.median(whisper) if whisper else FALLBACK_FACTOR,
-        "any": statistics.median(every) if every else FALLBACK_FACTOR,
-    }
+    """Same profiled predictor as running jobs; YouTube assumes audio is needed."""
+    model = estimates.load(conn)
+    return {"predictor": model, "whisper": model['rate'], "any": model['rate']}
 
 
 def estimate_seconds(duration: int | None, platform: str = "youtube",
@@ -57,16 +40,16 @@ def estimate_seconds(duration: int | None, platform: str = "youtube",
     if f is None:
         with closing(store.connect()) as conn:
             f = factors(conn)
-    return duration * (f["any"] if platform == "youtube" else f["whisper"])
+    return estimates.total(duration, platform, f['predictor'])
 
 
 def fmt_estimate(seconds: float | None) -> str:
     """'~4h 20m', '~12m', '<1m'; '?' when unknown."""
     if seconds is None:
         return "?"
+    if seconds < 60:
+        return f"~{max(5, round(seconds / 5) * 5)}s"
     m = round(seconds / 60)
-    if m < 1:
-        return "<1m"
     return f"~{m // 60}h {m % 60}m" if m >= 60 else f"~{m}m"
 
 
@@ -132,7 +115,7 @@ def cmd_list(conn) -> None:
         state = f"running · {r['stage'] or 'starting'}" if r["status"] == "running" else "waiting"
         print(f"{r['id']:>5}  {state:20}  {fmt_estimate(est):>8}  {r['name'] or r['video_id']}")
     print(f"{len(rows)} video{'s' if len(rows) != 1 else ''} · {fmt_estimate(total)}"
-          f"  (median realtime factor: whisper {f['whisper']:.3f}, all {f['any']:.3f})")
+          f"  (Whisper processing factor: {f['whisper']:.3f}; YouTube assumes audio is needed)")
 
 
 def cmd_run(conn) -> int:

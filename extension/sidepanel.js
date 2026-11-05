@@ -64,14 +64,14 @@ const host = {
     p.resolve(m);
   },
 
-  call(cmd, args = {}) {
+  call(cmd, args = {}, timeout = CALL_TIMEOUT) {
     if (!this.port) this.connect();
     const id = ++this.seq;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error("The host didn't answer"));
-      }, CALL_TIMEOUT);
+      }, timeout);
       this.pending.set(id, {
         parts: [],
         resolve: (v) => { clearTimeout(timer); resolve(v); },
@@ -95,6 +95,8 @@ const state = {
   showHidden: false,   // the Transcribe list includes rows hidden to save scrolling
   transcript: null,    // the open transcript, if any
   transcriptId: null,  // the video whose transcript screen is showing
+  retranscribingId: null,
+  preparingImport: false,
   threads: [],         // analyses, one per thread (analyse.js)
   prompts: { items: [], last: null },
   analysisJobs: [],
@@ -104,6 +106,12 @@ let pollTimer = null;
 
 async function refresh() {
   clearTimeout(pollTimer);
+  // The host finishes conversion before reading its next request. Polling
+  // during that step would time out and incorrectly show it as disconnected.
+  if (state.preparingImport) {
+    pollTimer = setTimeout(refresh, POLL_IDLE);
+    return;
+  }
   try {
     const s = await host.call("state");
     Object.assign(state, {
@@ -249,8 +257,8 @@ function fmtDuration(s) {
 // "~4h 20m" — the same rounding as batch.fmt_estimate().
 function fmtEstimate(s) {
   if (s == null) return null;
+  if (s < 60) return `~${Math.max(5, Math.round(s / 5) * 5)}s`;
   const m = Math.round(s / 60);
-  if (m < 1) return "<1m";
   return m >= 60 ? `~${Math.floor(m / 60)}h ${m % 60}m` : `~${m}m`;
 }
 
@@ -259,6 +267,7 @@ function render() {
   renderWorker();
   renderSelectBar();
   renderRows();
+  renderRetranscribe();
   if (typeof renderChannel === "function") renderChannel();
   const badge = $("unread");
   badge.textContent = state.unread;
@@ -312,7 +321,7 @@ function renderWorker() {
     return;
   }
   help.hidden = true;
-  const info = `${state.worker.model} · ${state.worker.threads} threads`;
+  const info = `${state.worker.model} · ${state.worker.gpu ? "GPU (Vulkan)" : "CPU"} · ${state.worker.threads} threads`;
   if (state.worker.busy) {
     w.dataset.state = "busy";
     text.textContent = `Worker busy · ${info}`;
@@ -332,28 +341,38 @@ const STAGE_LABEL = {
   captions: "checking captions",
   download: "downloading audio",
   whisper: "whisper",
+  loading: "loading Whisper model",
+  preparing: "detecting speech",
+  transcribing: "transcribing",
+  converting: "preparing audio",
+  finishing: "finishing transcript",
+  waiting_progress: "transcribing · updating estimate",
   saving: "saving",
 };
 
-// Remaining time and bar fraction for a running job, from the host's
-// estimates and the stage's start time. null remaining = not yet knowable.
+// The bar is measured audio progress, not elapsed time. Only the ETA counts
+// down between polls; no interpolation invents completed audio.
 function estimate(p) {
-  const now = Date.now() / 1000;
-  if (p.after_estimate == null || p.stage_estimate == null) return { left: null, frac: null };
-  const inStage = now - (p.stage_started || now);
-  const left = Math.max(p.stage_estimate - inStage, 0) + p.after_estimate;
-  const elapsed = now - (p.started || now);
-  const over = inStage > p.stage_estimate * 1.2 + 10;
-  return { left, over, frac: Math.min(elapsed / Math.max(elapsed + left, 1), 0.98) };
+  const age = Math.max(0, Date.now() / 1000 - p.reported_at);
+  const frac = p.fraction;
+  if (p.remaining == null) return { left: null, frac };
+  if (age > p.high + 2) return { left: null, frac };
+  return { left: Math.max(0, p.remaining - age),
+    low: Math.max(0, p.low - age), high: Math.max(0, p.high - age), frac };
 }
 
 function progressText(p) {
-  const stage = STAGE_LABEL[p.stage] || p.stage;
-  const { left, over } = estimate(p);
-  if (left == null) return stage;
-  if (over) return `${stage} · taking longer than usual`;
-  if (left < 60) return `${stage} · under a minute left`;
-  return `${stage} · about ${Math.round(left / 60)} min left`;
+  const stage = STAGE_LABEL[p.phase] || STAGE_LABEL[p.stage] || p.stage;
+  const { left, low, high, frac } = estimate(p);
+  const measured = frac == null ? stage : `${stage} · ${Math.floor(frac * 100)}%`;
+  if (left == null) return measured;
+  if (left < 3) return `${measured} · a few seconds left`;
+  const unit = high < 90 ? "sec" : "min";
+  const step = unit === "sec" ? 5 : 1;
+  const scale = unit === "sec" ? 1 : 60;
+  const lo = Math.max(0, Math.floor(low / scale / step) * step);
+  const hi = Math.max(lo + step, Math.ceil(high / scale / step) * step);
+  return `${measured} · about ${lo}–${hi} ${unit} left`;
 }
 
 function el(tag, cls, text) {
@@ -503,15 +522,18 @@ async function importRecording(file) {
       await host.call("rec_import_chunk", { rec_id: recId, offset, data: btoa(binary) });
       recordingTransferStatus(`Importing recording · ${Math.round((offset + bytes.length) / file.size * 100)}%`);
     }
-    await host.call("rec_import_finish", { rec_id: recId });
+    recordingTransferStatus("Preparing audio… Longer files may take a few minutes.");
+    state.preparingImport = true;
+    await host.call("rec_import_finish", { rec_id: recId }, 32 * 60 * 1000);
     recordingTransferStatus("Recording imported. Press Transcribe in the list when you are ready.");
-    refresh();
   } catch (error) {
     if (recId) await host.call("rec_import_abort", { rec_id: recId }).catch(() => {});
     recordingTransferStatus(`Import failed: ${error.message}`);
   } finally {
+    state.preparingImport = false;
     button.disabled = false;
     $("record-import-file").value = "";
+    refresh();
   }
 }
 
@@ -612,7 +634,7 @@ function buildRow(r) {
   } else if (r.state === "queued") {
     glyph.classList.add("plain");
     sub.textContent = [r.queue_position > 1 ? `queued · ${r.queue_position} in line` : "queued · next up",
-      fmtEstimate(r.estimate)].filter(Boolean).join(" · ");
+      fmtEstimate(r.estimate), r.estimate_conditional ? "if audio is needed" : null].filter(Boolean).join(" · ");
     li.append(el("span"));
   } else if (r.state === "saved") {
     glyph.classList.add("plain");
@@ -783,6 +805,7 @@ async function openTranscript(videoId) {
   openScreen("transcript");
   state.transcript = null;
   state.transcriptId = videoId;
+  renderRetranscribe();
 
   let parts;
   try {
@@ -794,6 +817,7 @@ async function openTranscript(videoId) {
   const head = parts[0];
   const segments = parts.flatMap((p) => p.segments);
   state.transcript = { ...head, segments };
+  renderRetranscribe();
   $("tr-title").textContent = head.title || videoId;
   $("tr-meta").textContent = [head.channel, fmtDuration(head.duration)].filter(Boolean).join(" · ");
   $("tr-source").textContent = head.source_label || "";
@@ -809,6 +833,38 @@ async function openTranscript(videoId) {
 
 function closeTranscript() {
   closeScreen("transcript");
+}
+
+function renderRetranscribe() {
+  const button = $("tr-retranscribe");
+  const row = rowFor(state.transcriptId);
+  button.hidden = !row?.has_audio || !row.has_transcript;
+  button.disabled = !state.connected || !state.transcript
+    || state.retranscribingId === state.transcriptId
+    || row?.state === "queued" || row?.state === "running";
+}
+
+async function retranscribe() {
+  const button = $("tr-retranscribe");
+  if (button.hidden || button.disabled) return;
+  const videoId = state.transcriptId;
+  state.retranscribingId = videoId;
+  $("tr-error").hidden = true;
+  renderRetranscribe();
+  try {
+    await host.call("retry", { video_id: videoId });
+    if (state.transcriptId === videoId) {
+      closeAllScreens();
+      setTab("transcribe");
+    }
+    await refresh();
+  } catch (error) {
+    $("tr-error").textContent = error.message;
+    $("tr-error").hidden = false;
+  } finally {
+    state.retranscribingId = null;
+    renderRetranscribe();
+  }
 }
 
 function transcriptText() {
@@ -904,6 +960,7 @@ $("link-form").addEventListener("submit", async (e) => {
 $("link-input").addEventListener("input", () => showLinkError(""));
 
 $("tr-back").addEventListener("click", closeTranscript);
+$("tr-retranscribe").addEventListener("click", retranscribe);
 $("tr-copy").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   await navigator.clipboard.writeText(transcriptText());

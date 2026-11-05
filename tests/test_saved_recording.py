@@ -13,6 +13,8 @@ import jobs
 import recording
 import store
 import transcribe
+import estimates
+import batch
 
 
 class SavedRecordingTests(unittest.TestCase):
@@ -30,7 +32,7 @@ class SavedRecordingTests(unittest.TestCase):
                                   and node.name in names], type_ignores=[])
         self.env = {"recording": recording, "store": store, "jobs": jobs, "tx": transcribe,
                     "log": logging.getLogger(__name__), "ensure_worker": Mock(),
-                    "ratios": lambda conn: (0.25, 0.01), "batch": Mock(),
+                    "estimates": estimates, "batch": batch,
                     "source_label": lambda value: value}
         exec(compile(module, "host_commands", "exec"), self.env)
         self.rec_id = "r0123456789abcde"

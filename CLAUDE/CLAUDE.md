@@ -94,11 +94,21 @@ setting ("auto" = the original audio) is tried first; if the video has no
 captions in that language, the original audio's are used. It is separate
 from `language`, which is only what whisper listens for.
 
-**Hardware: AMD GPU, so no CUDA.** whisper.cpp runs on the BLAS CPU build.
-Settings `-t 8 -bo 1 -bs 1` took a test clip from 56s to 26.6s. large-v3-turbo
-is *slower* than medium on CPU (bigger encoder, and encode is ~70% of runtime)
-despite being the better model. A Vulkan build would flip that, but it has to
-be compiled by hand — worth doing later, not now.
+**Hardware: AMD Radeon RX 7700 XT; GPU acceleration uses Vulkan.** The
+`whisper_gpu` setting is a toggle in Settings → Transcription. Off selects
+the original BLAS CPU build in `whisper/` and passes `--no-gpu`; on selects
+`whisper/vulkan/whisper-cli.exe`. `host/build-whisper-vulkan.ps1` builds the
+official pinned whisper.cpp sources using Visual Studio C++ tools and the
+Vulkan SDK. Models are shared. Help/flag detection is cached per executable,
+and GPU runs must report an active Vulkan backend before a result is accepted.
+The setting applies to the next transcription in the shared pipeline, including
+recordings; the standalone `transcribe_file.py` has its own configuration.
+Do not pass page titles or channel names as Whisper's initial prompt: it
+treats them as preceding transcript text. A numbered Russian lesson title
+reproducibly turned 90 seconds of speech into three invented numbered lines;
+without that prompt the same GPU run produced 17 continuous speech segments.
+Historically, CPU settings `-t 8 -bo 1 -bs 1` took a test clip from 56s to
+26.6s; compare model speeds again when changing backend.
 
 **yt-dlp needs `-f "bestaudio[protocol^=http]"`.** The default picks a
 fragmented HLS stream that dies under the owner's connection. YouTube media
@@ -128,11 +138,23 @@ a time is all this CPU takes. A batch job left `running` by a dead worker is
 requeued on the next start, once (`jobs.requeued`); a non-batch one fails as
 before, since someone is watching it.
 
-**Estimates use the median realtime_factor, never a constant**
-(`batch.estimate_seconds()`): whisper runs only for non-YouTube videos, which
-always go through whisper; every run for YouTube, since that is the mix a
-YouTube video gets. 0.25 only while there is no history. It is proportional,
-so it under-estimates very short videos, where loading the model dominates.
+**Estimates share one predictor (`estimates.py`) across running jobs and queues.**
+Whisper sends progress through the worker to `jobs.progress_json`; the bar is
+reported audio progress, never elapsed/predicted time. Loading, VAD preparation,
+conversion/download and saving are separate phases; saving must finish before
+the row is complete. ETA ranges count down between polls, adapt to recent
+progress deltas, and expire if reports stall. Short jobs use seconds.
+
+`submissions.performance` stores the exact runtime profile, measured startup,
+post-VAD work duration and a training eligibility flag. Profiles include machine,
+CPU/Vulkan, model/build file identities, threads, language, VAD and decoder
+settings. Unprofiled legacy rows never train Whisper estimates. Recent matching
+runs fit a fixed startup plus median per-audio-second processing cost, with
+outlier limits; repetition-heavy transcripts are excluded. Cold-start priors
+are deliberately broad. Local conversion and network download timings remain
+separate. YouTube queue estimates assume audio is needed, and say so.
+`python estimates.py` reports chronological holdout error/range coverage after
+at least four eligible runs per profile; it never trains on a future result.
 
 **Channel listings don't fetch per-video metadata.** `--flat-playlist` gives
 id, title and duration from the listing pages; a request per video would
@@ -348,13 +370,17 @@ actual site audio and Chrome capture permissions still need browser checks.
 
 **Recordings can be transferred as plain audio.** Download audio on a saved,
 failed or transcribed recording exports its original `audio.webm` without
-re-encoding. Import recording (.webm) in the intake uploads that file into a
-new recording ID, validates that ffprobe finds audio, and registers it as
+re-encoding. Import audio or video accepts any local media ffmpeg can read,
+uploads it into a new recording ID, validates that ffprobe finds audio, and registers it as
 `saved`. Neither import nor export queues transcription. The title comes
 from the filename; original page metadata and analysis history are not in
 the audio export. `rec_export` reads one 384,000-byte chunk per request;
-`rec_import_start/chunk/finish` write to `import.webm` with checked offsets
+`rec_import_start/chunk/finish` write to `import.media` with checked offsets
 and a declared byte count, then publish `audio.webm` only after validation.
+Single-track audio WebM is preserved byte for byte; other containers are
+normalized to audio-only WebM (first audio track, Opus/Vorbis copied, other
+codecs converted to 128 kbps Opus). Conversion finishes before publishing.
+The panel allows a longer finish timeout and pauses polling during conversion.
 Aborting cannot remove a completed import if its success reply was lost.
 The receiving device uses its own installed Whisper backend and settings.
 

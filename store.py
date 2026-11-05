@@ -76,6 +76,7 @@ def migrate(conn) -> None:
         ("submissions", "low_conf_count", "INTEGER"),
         ("submissions", "lang_p", "REAL"),
         ("submissions", "fallbacks", "INTEGER"),
+        ("submissions", "performance", "TEXT"),
         # Soft delete: the UI hides the row and its files are removed, but the
         # row stays for the before/after comparison. See soft_delete_video().
         ("videos", "deleted_at", "TEXT"),
@@ -192,8 +193,8 @@ def record_submission(conn, result: dict, entry_point: str = "link",
             source, language, transcript_path,
             caption_track, coverage, density, words_per_min, caption_reasons,
             confidence, low_conf_count, lang_p, fallbacks,
-            t_metadata, t_captions, t_download, t_whisper, t_total, realtime_factor
-        ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?)
+            t_metadata, t_captions, t_download, t_whisper, t_total, realtime_factor, performance
+        ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?)
         """,
         (
             result["video_id"], now(), entry_point, "done", None,
@@ -205,6 +206,7 @@ def record_submission(conn, result: dict, entry_point: str = "link",
             result.get("lang_p"), result.get("fallbacks"),
             t.get("metadata"), t.get("captions"), t.get("download"),
             t.get("whisper"), t.get("total"), t.get("realtime_factor"),
+            json.dumps(result.get("performance")) if result.get("performance") else None,
         ),
     )
     return cur.lastrowid

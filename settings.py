@@ -93,6 +93,7 @@ def _analysis_provider(v):
 SPEC = {
     "whisper_model":     (lambda: str(_const("transcribe", "WHISPER_MODEL")()).replace("\\", "/"), _model),
     "whisper_threads":   (_const("transcribe", "WHISPER_THREADS"), _number(1, 64, integer=True)),
+    "whisper_gpu":       (_const("transcribe", "WHISPER_GPU"), _bool),
     "language":          (_const("transcribe", "WHISPER_LANGUAGE"), _language),
     "vad_enabled":       (_const("transcribe", "WHISPER_VAD"), _bool),
     "vad_threshold":     (_const("transcribe", "WHISPER_VAD_THRESHOLD"), _optional(_number(0, 1))),

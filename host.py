@@ -56,14 +56,9 @@ import recording
 import settings
 import store
 import transcribe as tx
+import estimates
 
 log = logging.getLogger("host")
-
-# Fallbacks until there is history to average over. whisper at ~0.25x
-# realtime is the figure measured on this machine (see CLAUDE.md).
-DEFAULT_WHISPER_RATIO = 0.25    # whisper seconds per second of video
-DEFAULT_DOWNLOAD_RATIO = 0.03   # download seconds per second of video
-STAGE_GUESS = {"metadata": 3, "captions": 3, "saving": 2}
 
 SPAWN_GRACE = 15                # seconds to let a new worker write its first heartbeat
 SEGMENTS_PER_MESSAGE = 800      # Chrome caps host->extension messages at 1 MB
@@ -139,39 +134,6 @@ def model_label() -> str:
 
 # --- building the list -----------------------------------------------------
 
-def ratios(conn) -> tuple[float, float]:
-    row = conn.execute(
-        """SELECT AVG(s.t_whisper / v.duration) AS w, AVG(s.t_download / v.duration) AS d
-           FROM submissions s JOIN videos v USING (video_id)
-           WHERE s.status = 'done' AND v.duration > 0 AND s.t_whisper IS NOT NULL"""
-    ).fetchone()
-    return (row["w"] or DEFAULT_WHISPER_RATIO, row["d"] or DEFAULT_DOWNLOAD_RATIO)
-
-
-def progress(job, duration, whisper_ratio, download_ratio) -> dict:
-    """
-    Estimates, not measurements: whisper runs with its output discarded, so
-    the only clock is the stage start time and past runs' speed. `after` is
-    None while it is still unknown whether whisper will be needed at all.
-    """
-    stage = job["stage"] or "queued"
-    est, after = STAGE_GUESS.get(stage), None
-    if duration:
-        if stage == "download":
-            est, after = download_ratio * duration, whisper_ratio * duration + STAGE_GUESS["saving"]
-        elif stage == "whisper":
-            est, after = whisper_ratio * duration, STAGE_GUESS["saving"]
-        elif stage == "saving":
-            after = 0
-    return {
-        "stage": stage,
-        "stage_started": job["stage_started_at"],
-        "stage_estimate": est,
-        "after_estimate": after,
-        "started": job["started_at"],
-    }
-
-
 def short_error(error: str | None) -> str:
     """'DownloadError: ERROR: [youtube] abc: Unable to …' -> 'Unable to …'"""
     lines = (error or "").strip().splitlines()
@@ -205,8 +167,9 @@ def build_rows(conn) -> list[dict]:
     transcribing = jobs.active(conn, jobs.TRANSCRIBE_KINDS)
     active = {j["video_id"]: j for j in transcribing}
     queue_order = [j["id"] for j in transcribing if j["status"] == "queued"]
-    whisper_ratio, download_ratio = ratios(conn)
     factors = batch.factors(conn)
+    current_model = factors['predictor']
+    profiles = {}
 
     rows = {}
     for v in videos:
@@ -255,11 +218,16 @@ def build_rows(conn) -> list[dict]:
             "error": None,
         })
         if job["status"] == "running":
-            base["progress"] = progress(job, duration, whisper_ratio, download_ratio)
+            key = estimates.decode(job['progress_json']).get('profile')
+            if key and key not in profiles:
+                profiles[key] = estimates.load(conn, key)
+            model = profiles[key] if key else current_model
+            base["progress"] = estimates.progress(job, duration, model, tx.parse_url(job['url'])[0])
         else:
             base["queue_position"] = queue_order.index(job["id"]) + 1
             platform = tx.parse_url(job["url"])[0]
             base["estimate"] = batch.estimate_seconds(duration, platform, factors)
+            base['estimate_conditional'] = platform == 'youtube'
         rows[vid] = base
 
     return sorted(rows.values(), key=lambda r: r["order"], reverse=True)
@@ -277,6 +245,7 @@ def cmd_state(conn, msg) -> dict:
             "busy": running,
             "model": model_label(),
             "threads": settings.get("whisper_threads"),
+            "gpu": settings.get("whisper_gpu"),
         },
         "rows": build_rows(conn),
         "threads": threads,
@@ -839,6 +808,7 @@ def cmd_settings_get(conn, msg) -> dict:
         "defaults": settings.defaults(),
         "stored": sorted(settings.stored()),
         "models": models,
+        "gpu_build_present": tx.WHISPER_GPU_EXE.is_file(),
         "vad_model_present": tx.WHISPER_VAD_MODEL.exists(),
         "vad_model": str(tx.WHISPER_VAD_MODEL).replace("\\", "/"),
     }

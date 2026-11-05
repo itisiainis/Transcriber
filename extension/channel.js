@@ -109,7 +109,8 @@ function buildPickRow(v) {
   const title = el("div", "title", v.title || v.video_id);
   title.title = v.title || v.video_id;
   const sub = el("div", "sub",
-    [fmtListedDate(v), fmtDuration(v.duration), can ? fmtEstimate(v.estimate) : STATE_NOTE[st]]
+    [fmtListedDate(v), fmtDuration(v.duration), can ? fmtEstimate(v.estimate) : STATE_NOTE[st],
+      can && v.platform === "youtube" ? "if audio is needed" : null]
       .filter(Boolean).join(" · "));
   body.append(title, sub);
   li.append(lead, body, el("span"));

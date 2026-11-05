@@ -94,9 +94,12 @@ def run_transcribe(job) -> None:
     import transcribe as tx     # heavy (yt-dlp); only once there is work
 
     meta: dict = {}
+    def report(event):
+        with closing(jobs.connect()) as conn:
+            jobs.report_progress(conn, job["id"], event)
     try:
         with reporting_stages(tx, job["id"], meta):
-            result = tx.transcribe(job["url"])
+            result = tx.transcribe(job["url"], on_progress=lambda pct: report({"pct": pct}), on_status=report)
 
         with closing(jobs.connect()) as conn:
             jobs.set_stage(conn, job["id"], "saving")

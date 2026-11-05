@@ -84,6 +84,8 @@ def audio_path(rec_id: str) -> Path:
 
 
 TRANSFER_CHUNK = 384_000  # raw bytes; base64 stays below native messaging limits
+IMPORT_BITRATE = 128000  # preserve more detail when converting uploaded media
+IMPORT_TIMEOUT = 1800    # long videos may take more than the usual host timeout
 
 
 def export_chunk(rec_id: str, offset: int) -> dict:
@@ -100,21 +102,21 @@ def export_chunk(rec_id: str, offset: int) -> dict:
 
 def begin_import(filename: str, size: int) -> str:
     name = re.split(r"[\\/]", filename or "")[-1]
-    if not name.lower().endswith(".webm"):
-        raise ValueError("Choose a .webm recording exported from Transcriber")
+    if not name.strip():
+        raise ValueError("Choose an audio or video file")
     if size <= 0:
         raise ValueError("The recording is empty")
-    rec_id = start(name[:-5], None, "Imported recording", False)
+    rec_id = start(Path(name).stem, None, "Imported recording", False)
     m = meta(rec_id)
     m.update({"import_size": size, "import_filename": name})
     _save_meta(rec_id, m)
-    (folder(rec_id) / "import.webm").touch()
+    (folder(rec_id) / "import.media").touch()
     return rec_id
 
 
 def import_chunk(rec_id: str, offset: int, data: bytes) -> int:
     m = meta(rec_id)
-    path = folder(rec_id) / "import.webm"
+    path = folder(rec_id) / "import.media"
     if m.get("finished_at") or not path.is_file():
         raise ValueError("No pending import")
     current = path.stat().st_size
@@ -129,19 +131,43 @@ def import_chunk(rec_id: str, offset: int, data: bytes) -> int:
 
 def finish_import(rec_id: str) -> dict:
     m = meta(rec_id)
-    path = folder(rec_id) / "import.webm"
+    path = folder(rec_id) / "import.media"
     if m.get("finished_at") or not path.is_file() or path.stat().st_size != m.get("import_size"):
         raise ValueError("Recording import is incomplete")
     probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-         "stream=codec_type", "-of", "json", str(path)],
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name:format=format_name", "-of", "json", str(path)],
         capture_output=True, text=True, timeout=30,
     )
-    if probe.returncode or not json.loads(probe.stdout).get("streams"):
+    info = json.loads(probe.stdout) if probe.returncode == 0 else {}
+    streams = info.get("streams", [])
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    if not audio:
         raise ValueError("This file does not contain readable recording audio")
-    path.replace(audio_path(rec_id))
+    # Preserve exported WebM recordings byte for byte. Other containers/codecs
+    # are converted to the same audio-only WebM used by browser recordings.
+    webm = "webm" in info.get("format", {}).get("format_name", "").split(",")
+    if webm and len(streams) == 1 and audio.get("codec_name") in ("opus", "vorbis"):
+        path.replace(audio_path(rec_id))
+    else:
+        prepared = folder(rec_id) / "prepared.webm"
+        try:
+            # Take the first audio track; discard video, subtitles and cover art.
+            codec = (["-c:a", "copy"] if audio.get("codec_name") in ("opus", "vorbis")
+                     else ["-c:a", "libopus", "-b:a", str(IMPORT_BITRATE), "-ac", "2"])
+            converted = subprocess.run(
+                ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(path),
+                 "-map", "0:a:0", "-vn", "-sn", "-dn", *codec, str(prepared)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=IMPORT_TIMEOUT,
+            )
+            if converted.returncode or not prepared.is_file() or not prepared.stat().st_size:
+                raise ValueError("Could not import this audio: " + converted.stderr.strip()[-300:])
+            prepared.replace(audio_path(rec_id))
+        finally:
+            prepared.unlink(missing_ok=True)
+        path.unlink()
     m.update({"finished_at": store.now(), "reason": "imported", "segments": 1,
-              "duration": duration(audio_path(rec_id)), "bytes": m["import_size"]})
+              "duration": duration(audio_path(rec_id)), "bytes": audio_path(rec_id).stat().st_size})
     _save_meta(rec_id, m)
     return m
 

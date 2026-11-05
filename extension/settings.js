@@ -9,6 +9,8 @@ const SETTINGS = [
     note: "Used when a video's captions are missing or fail the quality check.",
     fields: [
       { key: "whisper_model", label: "Whisper model", type: "model" },
+      { key: "whisper_gpu", label: "Use GPU (Vulkan)", type: "toggle",
+        hint: "Accelerate transcription with your graphics card. Off uses the CPU. Applies to the next transcription, including saved and imported recordings." },
       { key: "whisper_threads", label: "CPU threads", type: "number", min: 1, max: 64, step: 1 },
       {
         key: "language", label: "Whisper language", type: "select",
@@ -125,6 +127,7 @@ function control(f, value) {
     // Without the VAD model a run would fail, so it can't be switched on —
     // but it can always be switched off.
     if (f.key === "vad_enabled" && !d.vad_model_present && !value) box.disabled = true;
+    if (f.key === "whisper_gpu" && !d.gpu_build_present && !value) box.disabled = true;
     box.addEventListener("change", () => saveSetting(f.key, box.checked));
     wrap.append(box, el("span", "slider"));
     return wrap;
@@ -181,6 +184,9 @@ function renderSettings() {
       if (f.hint) row.append(el("p", "hint", f.hint));
       if (f.key === "vad_enabled" && !d.vad_model_present) {
         row.append(el("p", "hint warn", `Needs ${d.vad_model} — from huggingface.co/ggml-org/whisper-vad`));
+      }
+      if (f.key === "whisper_gpu" && !d.gpu_build_present) {
+        row.append(el("p", "hint warn", "GPU support needs a one-time setup: run host/build-whisper-vulkan.ps1 in the project folder."));
       }
       if (settingsUi.errors[f.key]) row.append(el("p", "form-error", settingsUi.errors[f.key]));
       sec.append(row);

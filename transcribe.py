@@ -18,6 +18,8 @@ import re
 import subprocess
 import sys
 import time
+import wave
+import estimates
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,6 +41,8 @@ CAPTION_LANGUAGE = "auto"    # [setting] caption_language: preferred caption tra
                              # "auto" = the original audio's language
 
 WHISPER_EXE = Path("whisper/whisper-cli.exe")
+WHISPER_GPU_EXE = Path("whisper/vulkan/whisper-cli.exe")
+WHISPER_GPU = False                                    # [setting] whisper_gpu
 WHISPER_MODEL = Path("models/ggml-medium-q5_0.bin")     # [setting] whisper_model
 WHISPER_THREADS = 8                                     # [setting]
 WHISPER_LANGUAGE = "auto"    # [setting] language: whisper's -l; "auto" or a code like "ru"
@@ -332,23 +336,33 @@ def download_audio(vid: str, dest: Path, platform: str = "youtube") -> Path:
     return dest.with_suffix(".wav")
 
 
-_HELP_CACHE = None
+_HELP_CACHE = {}
 
 
-def whisper_supports(flag: str) -> bool:
+def whisper_executable(gpu: bool) -> Path:
+    exe = WHISPER_GPU_EXE if gpu else WHISPER_EXE
+    if not exe.is_file():
+        if gpu:
+            raise FileNotFoundError("GPU Whisper is not installed. Run host/build-whisper-vulkan.ps1 first, or turn off Use GPU in Settings.")
+        raise FileNotFoundError(f"Whisper executable is missing: {exe}")
+    return exe
+
+
+def whisper_supports(flag: str, exe: Path | None = None) -> bool:
     """
     Flag names drift between whisper.cpp builds, and an unknown one makes the
     whole run fail. Ask the binary once and cache its help text.
     """
-    global _HELP_CACHE
-    if _HELP_CACHE is None:
+    exe = exe or WHISPER_EXE
+    key = str(exe.resolve())
+    if key not in _HELP_CACHE:
         try:
-            p = subprocess.run([str(WHISPER_EXE), "-h"], capture_output=True,
+            p = subprocess.run([str(exe), "-h"], capture_output=True,
                                text=True, encoding="utf-8", errors="replace", timeout=30)
-            _HELP_CACHE = (p.stdout or "") + (p.stderr or "")
+            _HELP_CACHE[key] = (p.stdout or "") + (p.stderr or "")
         except Exception:
-            _HELP_CACHE = ""
-    return flag in _HELP_CACHE
+            return False
+    return flag in _HELP_CACHE[key]
 
 
 def _token_probability(tok) -> float | None:
@@ -375,27 +389,39 @@ def segment_confidence(seg: dict) -> float | None:
 
 
 def transcribe_audio(wav: Path, prompt: str | None = None,
-                     on_progress=None) -> dict:
+                     on_progress=None, on_status=None) -> dict:
     """
     Run whisper.cpp and parse its JSON.
 
-    This is the seam: to switch to a Vulkan build or a hosted API later,
-    replace the body of this function and nothing else changes.
+    The GPU setting selects the separate Vulkan build; CPU mode explicitly
+    disables GPU offload. Read settings once so toggling affects the next run.
 
     stderr is read rather than discarded — it carries live progress, the
     language-detection probability and the temperature-fallback count, all
     of which say something about how much to trust the result.
     """
+    process_started = time.perf_counter()
     out_base = wav.with_suffix("")
-    json_flag = "-ojf" if (WHISPER_FULL_JSON and whisper_supports("-ojf")) else "-oj"
 
     # Read once per run, so one transcription can't see a setting half-changed.
     s = settings.all()
+    exe = whisper_executable(s["whisper_gpu"])
+    supports = lambda flag: whisper_supports(flag, exe)
+    json_flag = "-ojf" if (WHISPER_FULL_JSON and supports("-ojf")) else "-oj"
     model = Path(s["whisper_model"])
     vad = s["vad_enabled"]
+    runtime = {"profile": estimates.profile(s), "startup": None, "work_seconds": None}
+    try:
+        with wave.open(str(wav), "rb") as audio:
+            runtime["work_seconds"] = audio.getnframes() / audio.getframerate()
+    except (OSError, wave.Error, EOFError):
+        pass
+    original_seconds = runtime["work_seconds"]
+    if on_status:
+        on_status({"profile": runtime["profile"], "phase": "loading", "work_seconds": original_seconds})
 
     cmd = [
-        str(WHISPER_EXE),
+        str(exe),
         "-m", str(model),
         "-f", str(wav),
         json_flag,
@@ -405,13 +431,17 @@ def transcribe_audio(wav: Path, prompt: str | None = None,
         "-bs", str(WHISPER_BEAM),
         "-bo", str(WHISPER_BEST_OF),
     ]
-    if whisper_supports("--print-progress"):
+    if not s["whisper_gpu"]:
+        if not supports("--no-gpu"):
+            raise RuntimeError("This Whisper build cannot force CPU mode (--no-gpu is missing).")
+        cmd.append("--no-gpu")
+    if supports("--print-progress"):
         cmd.append("--print-progress")
     if prompt:
         # Primes the decoder with expected vocabulary — mainly helps
         # proper nouns, which is where this model visibly slips.
         cmd += ["--prompt", prompt]
-    if vad and whisper_supports("--vad"):
+    if vad and supports("--vad"):
         if not WHISPER_VAD_MODEL.exists():
             raise FileNotFoundError(
                 f"VAD is on but {WHISPER_VAD_MODEL} is missing. Get it from "
@@ -431,11 +461,32 @@ def transcribe_audio(wav: Path, prompt: str | None = None,
     fb_re = re.compile(r"fallbacks\s*=\s*(\d+)\s*p\s*/\s*(\d+)\s*h")
     last_pct = -1
 
+    diagnostics = []
+    gpu_used = False
+    processing_started = False
     for line in proc.stderr:
+        diagnostics.append(line.rstrip())
+        diagnostics = diagnostics[-20:]
+        if "using Vulkan" in line and "backend" in line:
+            gpu_used = True
+            log.info("whisper GPU: %s", line.strip())
+        if "failed to initialize Vulkan" in line:
+            gpu_used = False
+        reduced = re.search(r"Reduced audio from \d+ to (\d+) samples", line)
+        if reduced:
+            runtime["work_seconds"] = int(reduced.group(1)) / 16000
+        if ("main: processing" in line and not vad) or reduced:
+            if not processing_started:
+                processing_started = True
+                runtime["startup"] = time.perf_counter() - process_started
+                if on_status:
+                    on_status({"phase": "transcribing", "work_seconds": runtime["work_seconds"]})
+        elif "main: processing" in line and vad and on_status:
+            on_status({"phase": "preparing"})
         m = pct_re.search(line)
         if m:
             pct = int(m.group(1))
-            if pct != last_pct:
+            if pct > last_pct:
                 last_pct = pct
                 if on_progress:
                     on_progress(pct)
@@ -450,7 +501,9 @@ def transcribe_audio(wav: Path, prompt: str | None = None,
             signals["fallbacks_h"] = int(m.group(2))
 
     if proc.wait() != 0:
-        raise RuntimeError(f"whisper exited {proc.returncode}")
+        raise RuntimeError(f"whisper exited {proc.returncode}: " + "\n".join(diagnostics)[-2000:])
+    if s["whisper_gpu"] and not gpu_used:
+        raise RuntimeError("Whisper did not activate the Vulkan GPU backend. Check the GPU driver or turn off Use GPU in Settings.")
 
     data = json.loads(out_base.with_suffix(".json").read_text(encoding="utf-8"))
 
@@ -469,6 +522,14 @@ def transcribe_audio(wav: Path, prompt: str | None = None,
     mean_conf = round(sum(confs) / len(confs), 3) if confs else None
     low = [s for s in segments
            if s["confidence"] is not None and s["confidence"] < LOW_CONF]
+    # Repetition can look fast and confident while producing unusable text.
+    # Exclude such runs from speed training rather than rewarding their speed.
+    normalized = [re.sub(r"[\W\d_]+", " ", seg["text"].lower()).strip() for seg in segments]
+    long_lines = [text for text in normalized if len(text) >= 20]
+    repeated = len(long_lines) >= 5 and len(set(long_lines)) < len(long_lines) * .6
+    runtime["eligible"] = not repeated and bool(segments)
+    runtime["speech_fraction"] = (runtime["work_seconds"] / original_seconds
+                                  if original_seconds and runtime["work_seconds"] is not None else None)
 
     if mean_conf is not None:
         log.info("whisper: confidence %.2f  low segments %d/%d  lang_p %s  fallbacks %s",
@@ -478,6 +539,7 @@ def transcribe_audio(wav: Path, prompt: str | None = None,
         log.info("whisper: no per-token data in this build's json (flag %s)", json_flag)
 
     return {
+        "performance": runtime,
         "source": f"whisper-{model.stem}" + ("-vad" if vad else ""),
         "language": data["result"]["language"],
         "segments": segments,
@@ -491,7 +553,7 @@ def transcribe_audio(wav: Path, prompt: str | None = None,
 
 # --- entry point -----------------------------------------------------------
 
-def transcribe(url: str, on_progress=None) -> dict:
+def transcribe(url: str, on_progress=None, on_status=None) -> dict:
     """URL -> metadata + transcript. Captions if usable, whisper otherwise."""
     t0 = time.perf_counter()
     timings = {}
@@ -526,8 +588,10 @@ def transcribe(url: str, on_progress=None) -> dict:
         timings["download"] = round(time.perf_counter() - t, 2)
         try:
             t = time.perf_counter()
-            prompt = " ".join(filter(None, [meta["title"], meta["channel"]]))
-            result = transcribe_audio(wav, prompt=prompt, on_progress=on_progress)
+            # Whisper treats an initial prompt as preceding transcript text.
+            # Titles (especially numbered lessons) can seed invented lists and
+            # repetition loops. Keep page metadata out of the decoder context.
+            result = transcribe_audio(wav, on_progress=on_progress, on_status=on_status)
             timings["whisper"] = round(time.perf_counter() - t, 2)
         finally:
             if not KEEP_AUDIO:

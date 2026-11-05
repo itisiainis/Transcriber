@@ -1,11 +1,12 @@
 import base64
+import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -71,7 +72,7 @@ class RecordingTransferTests(unittest.TestCase):
         self.assertFalse(recording.audio_path(rec_id).exists())
 
     def test_invalid_audio_is_rejected(self):
-        rec_id = self.upload(b"not an audio recording")
+        rec_id = self.upload(b"not an audio recording", "Lesson.mp3")
         with self.assertRaisesRegex(ValueError, "readable recording audio"):
             recording.finish_import(rec_id)
         self.assertFalse(recording.audio_path(rec_id).exists())
@@ -85,15 +86,84 @@ class RecordingTransferTests(unittest.TestCase):
         self.assertEqual(recording.import_chunk(rec_id, 0, b"abc"), 3)
         with self.assertRaises(ValueError):
             recording.import_chunk(rec_id, 0, b"abc")
-        self.assertEqual((recording.folder(rec_id) / "import.webm").read_bytes(), b"abc")
+        self.assertEqual((recording.folder(rec_id) / "import.media").read_bytes(), b"abc")
 
     def test_file_names_cannot_choose_storage_paths(self):
         rec_id = recording.begin_import("../../Lesson.webm", 10)
         self.assertEqual(recording.metadata(rec_id)["title"], "Lesson")
         self.assertEqual(recording.folder(rec_id).parent, recording.RECORD_DIR)
         with self.assertRaises(ValueError):
-            recording.begin_import("Lesson.exe", 10)
+            recording.begin_import("", 10)
         with self.assertRaises(ValueError):
             recording.begin_import("Lesson.webm", 0)
         with self.assertRaises(ValueError):
             recording.export_chunk("../../outside", 0)
+
+    def test_common_audio_formats_are_converted_and_exported_as_audio_webm(self):
+        for extension, codec in [('mp3', 'libmp3lame'), ('ogg', 'libvorbis'),
+                                 ('wav', 'pcm_s16le'), ('flac', 'flac'),
+                                 ('m4a', 'aac'), ('aac', 'aac'), ('opus', 'libopus')]:
+            with self.subTest(extension=extension):
+                source = Path(self.directory.name) / f'Lecture.part1.{extension}'
+                subprocess.run(['ffmpeg', '-v', 'error', '-i',
+                                str(Path(self.fixture_dir.name) / 'source.webm'),
+                                '-c:a', codec, str(source)], check=True, capture_output=True)
+                rec_id = self.upload(source.read_bytes(), source.name)
+                meta = recording.finish_import(rec_id)
+                self.assertEqual(recording.metadata(rec_id)['title'], 'Lecture.part1')
+                self.assertGreater(meta['duration'], 0)
+                self.assertEqual(meta['bytes'], recording.audio_path(rec_id).stat().st_size)
+                self.assertEqual(meta['import_size'], source.stat().st_size)
+                self.assertFalse((recording.folder(rec_id) / 'import.media').exists())
+                probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+                                        'stream=codec_type,codec_name', '-of', 'json',
+                                        str(recording.audio_path(rec_id))],
+                                       capture_output=True, text=True, check=True)
+                streams = json.loads(probe.stdout)['streams']
+                self.assertEqual(len(streams), 1)
+                self.assertEqual(streams[0]['codec_type'], 'audio')
+                self.assertIn(streams[0]['codec_name'], ('opus', 'vorbis'))
+                exported = recording.export_chunk(rec_id, 0)
+                self.assertEqual(exported['filename'], 'Lecture.part1.webm')
+                # The same conversion the transcription pipeline will use.
+                self.assertTrue(recording.to_wav(rec_id, Path(self.directory.name) / extension).is_file())
+
+    def test_mp4_video_import_extracts_only_audio(self):
+        source = Path(self.directory.name) / 'Lecture.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=size=16x16:rate=1:duration=1', '-i',
+                        str(Path(self.fixture_dir.name) / 'source.webm'),
+                        '-c:v', 'mpeg4', '-c:a', 'aac', '-shortest', str(source)],
+                       check=True, capture_output=True)
+        rec_id = self.upload(source.read_bytes(), source.name)
+        recording.finish_import(rec_id)
+        probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type',
+                                '-of', 'json', str(recording.audio_path(rec_id))],
+                               capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(probe.stdout)['streams'], [{'codec_type': 'audio'}])
+
+    def test_video_without_audio_is_rejected(self):
+        source = Path(self.directory.name) / 'Silent.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=size=16x16:rate=1:duration=1', '-c:v', 'mpeg4', str(source)],
+                       check=True, capture_output=True)
+        rec_id = self.upload(source.read_bytes(), source.name)
+        with self.assertRaisesRegex(ValueError, 'readable recording audio'):
+            recording.finish_import(rec_id)
+        self.assertFalse(recording.audio_path(rec_id).exists())
+
+    def test_conversion_failure_does_not_publish_partial_audio(self):
+        rec_id = self.upload(self.audio, 'Lecture.mp3')
+        # Force conversion even though the fixture is already WebM.
+        probe = Mock(returncode=0, stdout=json.dumps({
+            'streams': [{'codec_type': 'audio', 'codec_name': 'mp3'}],
+            'format': {'format_name': 'mp3'}}))
+        prepared = recording.folder(rec_id) / 'prepared.webm'
+        prepared.write_bytes(b'partial output')
+        with patch.object(recording.subprocess, 'run', side_effect=[
+                probe, Mock(returncode=1, stderr='decoder failed')]):
+            with self.assertRaisesRegex(ValueError, 'Could not import this audio'):
+                recording.finish_import(rec_id)
+        self.assertFalse(recording.audio_path(rec_id).exists())
+        self.assertFalse(prepared.exists())
+        self.assertNotIn('finished_at', recording.meta(rec_id))

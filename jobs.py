@@ -13,6 +13,7 @@ schema.sql. What a job *produced* still lands in submissions / analyses via
 store.py.
 """
 
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS worker (
 # Added after the table first shipped; (column, type). Same pattern as
 # store.migrate(): CREATE TABLE IF NOT EXISTS never adds columns.
 COLUMNS = [
+    ("progress_json", "TEXT"),
     ("prompt", "TEXT"),             # analyse: prompt name, or 'custom' for an ask
     ("question", "TEXT"),           # an ask or a follow-up
     ("session_id", "TEXT"),         # follow-up: the thread it continues
@@ -260,9 +262,30 @@ def dismiss(conn, job_id: int) -> None:
 
 def set_stage(conn, job_id: int, stage: str) -> None:
     conn.execute(
-        "UPDATE jobs SET stage = ?, stage_started_at = ? WHERE id = ?",
+        "UPDATE jobs SET stage = ?, stage_started_at = ?, progress_json = NULL WHERE id = ?",
         (stage, time.time(), job_id),
     )
+
+
+def report_progress(conn, job_id: int, event: dict) -> None:
+    import estimates
+    row = conn.execute("SELECT progress_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+        return
+    live = estimates.decode(row['progress_json'])
+    event = dict(event)
+    now = time.time()
+    if event.get('phase') == 'transcribing' and 'processing_at' not in live:
+        live['processing_at'] = now
+    if 'pct' in event:
+        pct = max(0, min(100, float(event.pop('pct'))))
+        if pct <= live.get('pct', -1):
+            return
+        live.update(pct=pct, updated_at=now, phase='transcribing')
+        live['samples'] = (live.get('samples', []) + [[pct, now]])[-12:]
+    live.update(event)
+    conn.execute("UPDATE jobs SET progress_json = ? WHERE id = ? AND status = 'running'",
+                 (json.dumps(live), job_id))
 
 
 def set_meta(conn, job_id: int, meta: dict) -> None:

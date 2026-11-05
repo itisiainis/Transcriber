@@ -53,8 +53,9 @@
           <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.5" class="fill"/></svg>
           Choose what to record
         </button>
-        <button class="wide-outline" id="record-import">Import recording (.webm)</button>
-        <input type="file" id="record-import-file" accept=".webm,audio/webm,video/webm" hidden>
+        <button class="wide-outline" id="record-import">Import audio or video</button>
+        <p class="hint">MP3, MP4, WAV, M4A, OGG, FLAC and other media with audio.</p>
+        <input type="file" id="record-import-file" hidden>
         <p class="hint" id="record-transfer-status" role="status" hidden></p>
       </div>
 
@@ -131,6 +132,10 @@
             <button class="tool" id="tr-download">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>
               <span>Download</span>
+            </button>
+            <button class="tool" id="tr-retranscribe" hidden title="Transcribe the saved audio again with current settings. Replaces the transcript when finished.">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 6a5 5 0 1 0 0 4M13 2.5V6H9.5"/></svg>
+              <span>Retranscribe</span>
             </button>
             <button class="tool danger" id="tr-delete">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 9h5.8l.6-9"/></svg>
