@@ -21,3 +21,6 @@ venv/
 host/com.transcriber.host.json
 # личные заметки
 CLAUDE/TASK.md
+
+# the whisper/models bundle, when unpacked here by setup
+/*.zip
